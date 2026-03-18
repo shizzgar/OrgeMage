@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from ..catalog import FederatedModelCatalog
 from ..downstream import MockDownstreamClient
 from ..models import DownstreamAgentConfig, SessionSnapshot, PlanTask, WorkerResult
 from .downstream_client import AcpDownstreamConnector, DownstreamConnector, DownstreamPromptResult
@@ -14,6 +15,39 @@ class _MockConnectorAdapter:
         self.agent = agent
         self.negotiated_state = None
         self._client = MockDownstreamClient()
+
+    def discover_catalog(self, *, force: bool = False) -> dict[str, object]:
+        return {
+            "agent_id": self.agent.agent_id,
+            "config_options": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "options": [
+                        {
+                            "value": option.value,
+                            "name": option.name,
+                            "description": option.description,
+                        }
+                        for option in self.agent.models
+                    ],
+                }
+            ],
+            "capabilities": {
+                "supports_terminal": self.agent.capabilities.supports_terminal,
+                "supports_filesystem": self.agent.capabilities.supports_filesystem,
+                "supports_permissions": self.agent.capabilities.supports_permissions,
+                "supports_plan_updates": self.agent.capabilities.supports_plan_updates,
+                "supports_images": self.agent.capabilities.supports_images,
+                "supports_mcp": self.agent.capabilities.supports_mcp,
+            },
+            "command_advertisements": list(self.agent.capabilities.commands),
+        }
+
+    def mark_catalog_refresh_required(self) -> None:
+        return None
 
     def execute_task(
         self,
@@ -62,6 +96,28 @@ class DownstreamConnectorManager:
             self._connectors[agent_id] = connector
         return connector
 
+    def refresh_catalog(
+        self,
+        catalog: FederatedModelCatalog,
+        *,
+        agent_id: str | None = None,
+        force: bool = False,
+    ) -> None:
+        target_ids = [agent_id] if agent_id else list(self._agents.keys())
+        for current_agent_id in target_ids:
+            connector = self.get_connector(current_agent_id)
+            try:
+                payload = connector.discover_catalog(force=force)
+            except Exception as exc:
+                catalog.record_discovery_failure(current_agent_id, str(exc))
+                continue
+            catalog.record_discovery(
+                agent_id=current_agent_id,
+                config_options=list(payload.get("config_options", [])),
+                capabilities=dict(payload.get("capabilities", {})),
+                command_advertisements=list(payload.get("command_advertisements", [])),
+            )
+
     def execute_task(
         self,
         *,
@@ -106,6 +162,10 @@ class DownstreamConnectorManager:
             if downstream_session_id is None:
                 continue
             self.get_connector(current_agent_id).cancel(downstream_session_id)
+
+    def mark_catalog_refresh_required(self, agent_id: str) -> None:
+        connector = self.get_connector(agent_id)
+        connector.mark_catalog_refresh_required()
 
     def _build_connector(self, agent: DownstreamAgentConfig) -> DownstreamConnector:
         if agent.runtime == "mock":

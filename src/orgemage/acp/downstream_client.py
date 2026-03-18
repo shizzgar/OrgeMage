@@ -6,6 +6,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 import importlib
 import threading
+import time
 from typing import Any, Callable, Protocol
 
 from ..models import DownstreamAgentConfig, DownstreamNegotiatedState, PlanTask, TaskStatus
@@ -28,6 +29,12 @@ class DownstreamPromptResult:
 class DownstreamConnector(Protocol):
     agent: DownstreamAgentConfig
     negotiated_state: DownstreamNegotiatedState | None
+
+    def discover_catalog(self, *, force: bool = False) -> dict[str, Any]:
+        ...
+
+    def mark_catalog_refresh_required(self) -> None:
+        ...
 
     def execute_task(
         self,
@@ -105,6 +112,16 @@ class AcpDownstreamConnector:
         self._process: Any = None
         self._sdk: _SdkBindings | None = None
         self._lock = threading.Lock()
+        self._catalog_state: dict[str, Any] | None = None
+        self._catalog_refresh_required = True
+
+    def discover_catalog(self, *, force: bool = False) -> dict[str, Any]:
+        self._ensure_started()
+        assert self._loop_thread is not None
+        return self._loop_thread.run(self._discover_catalog_async(force=force))
+
+    def mark_catalog_refresh_required(self) -> None:
+        self._catalog_refresh_required = True
 
     def execute_task(
         self,
@@ -176,6 +193,7 @@ class AcpDownstreamConnector:
             auth_methods=payload.get("auth_methods") or payload.get("authMethods") or [],
             protocol_version=payload.get("protocol_version") or payload.get("protocolVersion"),
         )
+        await self._refresh_catalog_async(force=True)
 
     async def _close_async(self) -> None:
         if self._context_manager is not None:
@@ -184,11 +202,20 @@ class AcpDownstreamConnector:
         self._conn = None
         self._process = None
         self._sdk = None
+        self._catalog_state = None
+        self._catalog_refresh_required = True
 
     async def _cancel_async(self, downstream_session_id: str) -> None:
         if self._conn is None:
             return
         await self._conn.cancel(session_id=downstream_session_id)
+
+    async def _discover_catalog_async(self, *, force: bool = False) -> dict[str, Any]:
+        if self._conn is None:
+            raise DownstreamConnectorError(f"Downstream agent '{self.agent.agent_id}' is not connected")
+        if not force and self._catalog_state is not None and not self._catalog_refresh_required:
+            return dict(self._catalog_state)
+        return await self._refresh_catalog_async(force=force)
 
     async def _execute_task_async(
         self,
@@ -205,7 +232,7 @@ class AcpDownstreamConnector:
 
         session_id, session_payload = await self._ensure_session_async(cwd, downstream_session_id)
         self._record_session_state(session_id, session_payload)
-        await self._apply_model_selection_async(session_id, selected_model)
+        await self._apply_model_selection_async(session_id, selected_model, cwd=cwd)
 
         prompt_text = self._build_prompt(
             orchestrator_session_id=orchestrator_session_id,
@@ -249,7 +276,7 @@ class AcpDownstreamConnector:
             )
         return str(created_session_id), created
 
-    async def _apply_model_selection_async(self, session_id: str, selected_model: str) -> None:
+    async def _apply_model_selection_async(self, session_id: str, selected_model: str, *, cwd: str) -> None:
         if self._conn is None:
             return
         raw_model = self.agent.resolve_model(selected_model) or self.agent.default_model
@@ -261,6 +288,7 @@ class AcpDownstreamConnector:
         if not any(option.get("id") == "model" for option in config_options):
             return
         await self._conn.set_config_option(session_id=session_id, option_id="model", value=raw_model)
+        await self._refresh_catalog_async(force=True, cwd=cwd, downstream_session_id=session_id)
 
     def _record_session_state(self, session_id: str, session_payload: Any) -> None:
         if self.negotiated_state is None:
@@ -277,6 +305,50 @@ class AcpDownstreamConnector:
             capabilities=session_capabilities,
             config_options=config_options,
         )
+
+    async def _refresh_catalog_async(
+        self,
+        *,
+        force: bool = False,
+        cwd: str | None = None,
+        downstream_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self._conn is None:
+            raise DownstreamConnectorError(f"Downstream agent '{self.agent.agent_id}' is not connected")
+        if not force and self._catalog_state is not None and not self._catalog_refresh_required:
+            return dict(self._catalog_state)
+        normalized_cwd = cwd or "."
+        if downstream_session_id and self.negotiated_state and self.negotiated_state.load_session_supported:
+            session_payload = await self._conn.load_session(
+                cwd=normalized_cwd,
+                mcp_servers=[],
+                session_id=downstream_session_id,
+            )
+            if session_payload is None:
+                session_payload = await self._conn.new_session(cwd=normalized_cwd, mcp_servers=[])
+        else:
+            session_payload = await self._conn.new_session(cwd=normalized_cwd, mcp_servers=[])
+        payload = _to_plain_data(session_payload)
+        session_id = str(payload.get("session_id") or payload.get("sessionId") or downstream_session_id or "")
+        if session_id:
+            self._record_session_state(session_id, session_payload)
+        config_options = payload.get("config_options") or payload.get("configOptions") or []
+        capabilities = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"config_options", "configOptions", "session_id", "sessionId"}
+        }
+        if self.negotiated_state is not None:
+            capabilities = {**self.negotiated_state.agent_capabilities, **capabilities}
+        self._catalog_state = {
+            "agent_id": self.agent.agent_id,
+            "config_options": config_options,
+            "capabilities": capabilities,
+            "command_advertisements": _extract_command_advertisements(capabilities),
+            "refreshed_at": time.time(),
+        }
+        self._catalog_refresh_required = False
+        return dict(self._catalog_state)
 
     def _build_prompt(
         self,
@@ -408,3 +480,18 @@ def _to_plain_data(value: Any) -> Any:
     if hasattr(value, "__dict__"):
         return {key: _to_plain_data(item) for key, item in vars(value).items() if not key.startswith("_")}
     return str(value)
+
+
+def _extract_command_advertisements(capabilities: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("commands", "command_ads", "commandAdvertisements", "advertised_commands", "advertisedCommands"):
+        value = capabilities.get(key)
+        if isinstance(value, list):
+            candidates.extend(str(item) for item in value if item)
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in candidates:
+        if item not in seen:
+            result.append(item)
+            seen.add(item)
+    return result

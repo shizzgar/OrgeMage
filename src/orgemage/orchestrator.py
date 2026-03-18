@@ -37,12 +37,14 @@ class Orchestrator:
             title=f"OrgeMage: {Path(normalized_cwd).name or normalized_cwd}",
         )
         if selected_model:
+            self._refresh_catalog_for_model(selected_model)
             resolved = self.catalog.resolve(selected_model)
             snapshot.coordinator_agent_id = resolved.agent.agent_id
         self.store.save(snapshot)
         return snapshot
 
-    def list_model_options(self) -> list[dict[str, str]]:
+    def list_model_options(self) -> list[dict[str, object]]:
+        self.connector_manager.refresh_catalog(self.catalog)
         return self.catalog.northbound_model_options()
 
     def list_sessions(self) -> list[SessionHistoryEntry]:
@@ -63,6 +65,7 @@ class Orchestrator:
 
     def set_selected_model(self, session_id: str, composite_model: str) -> SessionSnapshot:
         snapshot = self._require_session(session_id)
+        self._refresh_catalog_for_model(composite_model)
         resolved = self.catalog.resolve(composite_model)
         snapshot.selected_model = composite_model
         snapshot.coordinator_agent_id = resolved.agent.agent_id
@@ -89,6 +92,7 @@ class Orchestrator:
         if not snapshot.selected_model:
             default_option = self.list_model_options()[0]["value"]
             snapshot = self.set_selected_model(session_id, default_option)
+        self._refresh_catalog_for_model(snapshot.selected_model or "")
         resolved = self.catalog.resolve(snapshot.selected_model or "")
 
         turn = OrchestrationTurnState(status="running", turn_id=f"turn-{uuid.uuid4().hex[:12]}")
@@ -129,6 +133,12 @@ class Orchestrator:
         }
         self._emit_message_update(snapshot, summary, result, emit_update)
         return result
+
+
+    def _refresh_catalog_for_model(self, composite_model: str) -> None:
+        agent_id, _, _ = composite_model.partition("::")
+        if agent_id and agent_id in {agent.agent_id for agent in self.catalog.agents}:
+            self.connector_manager.refresh_catalog(self.catalog, agent_id=agent_id)
 
     def cancel(self, session_id: str, agent_id: str | None = None) -> SessionSnapshot:
         snapshot = self._require_session(session_id)
