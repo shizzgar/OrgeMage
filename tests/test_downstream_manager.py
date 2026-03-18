@@ -75,7 +75,7 @@ def test_connector_manager_caches_connectors_and_persists_session_mapping() -> N
     assert len(created) == 1
     assert first.metadata["downstream_session_id"] == "downstream-codex"
     assert second.metadata["downstream_session_id"] == "downstream-codex"
-    assert session.metadata["downstream_sessions"]["codex"] == "downstream-codex"
+    assert session.downstream_session_map()["codex"] == "downstream-codex"
     assert session.metadata["downstream_negotiated"]["codex"]["agent_info"] == {"name": "Codex"}
     assert created[0].calls[0]["downstream_session_id"] is None
     assert created[0].calls[1]["downstream_session_id"] == "downstream-codex"
