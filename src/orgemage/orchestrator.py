@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 from pathlib import Path
 import textwrap
 import uuid
@@ -8,7 +7,7 @@ from typing import Any, Callable
 
 from .acp.manager import DownstreamConnectorManager
 from .catalog import FederatedModelCatalog
-from .models import DownstreamAgentConfig, PlanTask, SessionHistoryEntry, SessionSnapshot, TaskStatus, ToolEvent
+from .models import DownstreamAgentConfig, OrchestrationTurnState, PlanTask, SessionHistoryEntry, SessionSnapshot, TaskExecutionState, TaskStatus, ToolEvent, TraceCorrelationState
 from .scheduler import Scheduler
 from .state import SQLiteSessionStore
 
@@ -59,7 +58,7 @@ class Orchestrator:
             "coordinator_agent_id": snapshot.coordinator_agent_id,
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
-            "task_count": len(snapshot.task_graph),
+            "task_count": len(snapshot.task_states),
         }
 
     def set_selected_model(self, session_id: str, composite_model: str) -> SessionSnapshot:
@@ -92,8 +91,15 @@ class Orchestrator:
             snapshot = self.set_selected_model(session_id, default_option)
         resolved = self.catalog.resolve(snapshot.selected_model or "")
 
+        turn = OrchestrationTurnState(status="running", turn_id=f"turn-{uuid.uuid4().hex[:12]}")
+        snapshot.turns.append(turn)
+        self.store.create_or_update_turn_state(snapshot.session_id, turn)
+
         plan = self._build_plan(user_prompt, resolved.agent.agent_id)
         plan = self.scheduler.assign_tasks(plan, self.catalog.agents, resolved.agent.agent_id)
+        snapshot.task_states = [TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id) for task in plan]
+        for task_state in snapshot.task_states:
+            self.store.persist_task_update(snapshot.session_id, task_state)
         self._emit_plan_update(snapshot, plan, emit_update)
         tool_events = self._run_tasks(
             snapshot=snapshot,
@@ -101,13 +107,16 @@ class Orchestrator:
             coordinator_agent=resolved.agent,
             user_prompt=user_prompt,
             tasks=plan,
+            turn=turn,
             emit_update=emit_update,
         )
-        snapshot.task_graph = [task.to_dict() for task in plan]
-        self.store.save(snapshot)
+        turn.status = "completed"
+        turn.stop_reason = "end_turn"
+        self.store.create_or_update_turn_state(snapshot.session_id, turn)
+        snapshot = self._require_session(session_id)
         summary = self._final_summary(plan)
         result = {
-            "session": asdict(snapshot),
+            "session": snapshot.to_dict(),
             "coordinator": {
                 "agent_id": resolved.agent.agent_id,
                 "agent_name": resolved.agent.name,
@@ -170,6 +179,7 @@ class Orchestrator:
         coordinator_agent: DownstreamAgentConfig,
         user_prompt: str,
         tasks: list[PlanTask],
+        turn: OrchestrationTurnState,
         emit_update: SessionUpdateCallback | None,
     ) -> list[ToolEvent]:
         events: list[ToolEvent] = []
@@ -177,6 +187,12 @@ class Orchestrator:
         agents_by_id = {agent.agent_id: agent for agent in self.catalog.agents}
         for task in tasks:
             task.status = TaskStatus.IN_PROGRESS
+            task_state = snapshot.get_task_state(task.task_id) or TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id)
+            task_state.status = task.status
+            task_state.assignee = task.assignee
+            task_state.dependency_state = "blocked" if task.dependency_ids else "ready"
+            self.store.persist_task_update(snapshot.session_id, task_state)
+            snapshot.upsert_task_state(task_state)
             started_event = ToolEvent(
                 tool_call_id=task.task_id,
                 title=task.title,
@@ -194,8 +210,29 @@ class Orchestrator:
                 selected_model=selected_model,
                 agent=agent,
             )
+            downstream_session_id = result.metadata.get("downstream_session_id")
+            if isinstance(downstream_session_id, str):
+                self.store.save_downstream_session_mapping(snapshot.session_id, agent.agent_id, downstream_session_id)
+            negotiated = snapshot.metadata.get("downstream_negotiated", {}).get(agent.agent_id)
+            if negotiated is not None:
+                self.store.persist_trace_metadata(
+                    snapshot.session_id,
+                    TraceCorrelationState(
+                        trace_key=f"negotiated:{agent.agent_id}",
+                        task_id=task.task_id,
+                        turn_id=turn.turn_id,
+                        metadata={"agent_id": agent.agent_id, "negotiated": negotiated},
+                    ),
+                )
             task.status = result.status
             task.output = result.summary
+            task_state = snapshot.get_task_state(task.task_id) or TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id)
+            task_state.status = result.status
+            task_state.output = result.summary
+            task_state.assignee = task.assignee
+            task_state.plan_metadata.update({"worker_result": dict(result.metadata)})
+            self.store.persist_task_update(snapshot.session_id, task_state)
+            snapshot.upsert_task_state(task_state)
             finished_event = ToolEvent(
                 tool_call_id=task.task_id,
                 title=task.title,
@@ -205,7 +242,6 @@ class Orchestrator:
             )
             events.append(finished_event)
             self._emit_tool_call_update(snapshot, task, finished_event, emit_update)
-            self.store.save(snapshot)
         return events
 
     def _coordinator_instruction(self, user_prompt: str) -> str:

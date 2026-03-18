@@ -72,8 +72,7 @@ class DownstreamConnectorManager:
         agent: DownstreamAgentConfig,
     ) -> WorkerResult:
         connector = self.get_connector(agent.agent_id)
-        mappings = session.metadata.setdefault("downstream_sessions", {})
-        downstream_session_id = mappings.get(agent.agent_id)
+        downstream_session_id = session.get_downstream_session_id(agent.agent_id)
         prompt_result = connector.execute_task(
             orchestrator_session_id=session.session_id,
             downstream_session_id=downstream_session_id,
@@ -82,7 +81,7 @@ class DownstreamConnectorManager:
             coordinator_prompt=coordinator_prompt,
             selected_model=selected_model,
         )
-        mappings[agent.agent_id] = prompt_result.downstream_session_id
+        session.set_downstream_session_mapping(agent.agent_id, prompt_result.downstream_session_id)
         negotiated = getattr(connector, "negotiated_state", None)
         if negotiated is not None:
             session.metadata.setdefault("downstream_negotiated", {})[agent.agent_id] = negotiated.to_dict()
@@ -100,7 +99,7 @@ class DownstreamConnectorManager:
         )
 
     def cancel_session(self, session: SessionSnapshot, agent_id: str | None = None) -> None:
-        mappings = session.metadata.get("downstream_sessions", {})
+        mappings = session.downstream_session_map()
         target_ids = [agent_id] if agent_id else list(mappings.keys())
         for current_agent_id in target_ids:
             downstream_session_id = mappings.get(current_agent_id)
