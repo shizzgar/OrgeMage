@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orgemage"
+version = "0.1.0"
+description = "ACP-native multi-agent orchestrator with unified model selection"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "OpenAI Codex" }]
+dependencies = []
+
+[project.optional-dependencies]
+acp = ["agent-client-protocol>=0.8.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+orgemage = "orgemage.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
