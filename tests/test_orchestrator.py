@@ -42,12 +42,15 @@ def test_orchestrator_selects_coordinator_and_runs_plan(tmp_path: Path) -> None:
 
     assert result["coordinator"]["agent_id"] == "codex"
     assert len(result["plan"]) == 4
+    assert result["planning"]["normalized_plan"]["_meta"]["source"] == "coordinator"
+    assert result["planning"]["raw_coordinator_output"]
     assert all(task["status"] == "completed" for task in result["plan"])
     assert len(result["tool_events"]) == 8
     assert result["summary"] == "Completed 4/4 orchestrated tasks."
     assert result["session"]["downstream_session_mappings"][0]["downstream_session_id"].startswith("mock-codex-")
     assert result["session"]["turns"][0]["status"] == "completed"
     assert len(result["session"]["task_states"]) == 4
+    assert result["session"]["metadata"]["planning"]["normalized_plan"]["_meta"]["source"] == "coordinator"
 
 
 def test_orchestrator_defaults_to_first_model_if_none_selected(tmp_path: Path) -> None:
