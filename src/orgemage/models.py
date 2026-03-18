@@ -57,6 +57,7 @@ class DownstreamAgentConfig:
     capabilities: AgentCapabilities = field(default_factory=AgentCapabilities)
     description: str = ""
     default_model: str | None = None
+    runtime: str = "acp"
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def composite_model_values(self) -> dict[str, ModelOption]:
@@ -70,6 +71,42 @@ class DownstreamAgentConfig:
         if composite_value.startswith(prefix):
             return composite_value[len(prefix) :]
         return None
+
+
+@dataclass(slots=True)
+class DownstreamNegotiatedState:
+    agent_id: str
+    agent_info: dict[str, Any] = field(default_factory=dict)
+    agent_capabilities: dict[str, Any] = field(default_factory=dict)
+    auth_methods: list[Any] = field(default_factory=list)
+    protocol_version: int | None = None
+    session_capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
+    config_options: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    @property
+    def load_session_supported(self) -> bool:
+        return bool(self.agent_capabilities.get("loadSession") or self.agent_capabilities.get("load_session"))
+
+    def record_session(
+        self,
+        *,
+        session_id: str,
+        capabilities: dict[str, Any] | None,
+        config_options: list[dict[str, Any]] | None,
+    ) -> None:
+        self.session_capabilities[session_id] = capabilities or {}
+        self.config_options[session_id] = config_options or []
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "agent_info": self.agent_info,
+            "agent_capabilities": self.agent_capabilities,
+            "auth_methods": self.auth_methods,
+            "protocol_version": self.protocol_version,
+            "session_capabilities": self.session_capabilities,
+            "config_options": self.config_options,
+        }
 
 
 @dataclass(slots=True)

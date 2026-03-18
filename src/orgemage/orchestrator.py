@@ -5,15 +5,9 @@ from pathlib import Path
 import textwrap
 import uuid
 
+from .acp.manager import DownstreamConnectorManager
 from .catalog import FederatedModelCatalog
-from .downstream import DownstreamClient, MockDownstreamClient
-from .models import (
-    DownstreamAgentConfig,
-    PlanTask,
-    SessionSnapshot,
-    TaskStatus,
-    ToolEvent,
-)
+from .models import DownstreamAgentConfig, PlanTask, SessionSnapshot, TaskStatus, ToolEvent
 from .scheduler import Scheduler
 from .state import SQLiteSessionStore
 
@@ -23,13 +17,13 @@ class Orchestrator:
         self,
         agents: list[DownstreamAgentConfig],
         store: SQLiteSessionStore | None = None,
-        downstream_client: DownstreamClient | None = None,
+        connector_manager: DownstreamConnectorManager | None = None,
     ) -> None:
         if not agents:
             raise ValueError("At least one downstream agent configuration is required")
         self.catalog = FederatedModelCatalog(agents)
         self.store = store or SQLiteSessionStore()
-        self.downstream_client = downstream_client or MockDownstreamClient()
+        self.connector_manager = connector_manager or DownstreamConnectorManager(agents)
         self.scheduler = Scheduler()
 
     def create_session(self, cwd: str, selected_model: str | None = None) -> SessionSnapshot:
@@ -57,6 +51,12 @@ class Orchestrator:
         self.store.save(snapshot)
         return snapshot
 
+    def load_session(self, session_id: str, selected_model: str | None = None) -> SessionSnapshot:
+        snapshot = self._require_session(session_id)
+        if selected_model is not None:
+            return self.set_selected_model(session_id, selected_model)
+        return snapshot
+
     def orchestrate(self, session_id: str, user_prompt: str) -> dict[str, object]:
         snapshot = self._require_session(session_id)
         if not snapshot.selected_model:
@@ -67,7 +67,7 @@ class Orchestrator:
         plan = self._build_plan(user_prompt, resolved.agent.agent_id)
         plan = self.scheduler.assign_tasks(plan, self.catalog.agents, resolved.agent.agent_id)
         tool_events = self._run_tasks(
-            session_id=session_id,
+            snapshot=snapshot,
             selected_model=resolved.option.value,
             coordinator_agent=resolved.agent,
             user_prompt=user_prompt,
@@ -88,6 +88,12 @@ class Orchestrator:
             "tool_events": [event.to_dict() for event in tool_events],
             "summary": summary,
         }
+
+    def cancel(self, session_id: str, agent_id: str | None = None) -> SessionSnapshot:
+        snapshot = self._require_session(session_id)
+        self.connector_manager.cancel_session(snapshot, agent_id=agent_id)
+        self.store.save(snapshot)
+        return snapshot
 
     def _build_plan(self, user_prompt: str, coordinator_agent_id: str) -> list[PlanTask]:
         normalized = user_prompt.strip()
@@ -126,7 +132,7 @@ class Orchestrator:
     def _run_tasks(
         self,
         *,
-        session_id: str,
+        snapshot: SessionSnapshot,
         selected_model: str,
         coordinator_agent: DownstreamAgentConfig,
         user_prompt: str,
@@ -147,8 +153,8 @@ class Orchestrator:
                 )
             )
             agent = agents_by_id[task.assignee or coordinator_agent.agent_id]
-            result = self.downstream_client.execute_task(
-                session_id=session_id,
+            result = self.connector_manager.execute_task(
+                session=snapshot,
                 task=task,
                 coordinator_prompt=coordinator_prompt,
                 selected_model=selected_model,
