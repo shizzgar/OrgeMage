@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 import textwrap
 import uuid
@@ -15,6 +16,7 @@ from .models import (
     SessionSnapshot,
     TaskExecutionState,
     TaskStatus,
+    TerminalMapping,
     ToolEvent,
     TraceCorrelationState,
 )
@@ -23,6 +25,247 @@ from .scheduler import Scheduler
 from .state import SQLiteSessionStore
 
 SessionUpdateCallback = Callable[[dict[str, Any]], None]
+
+
+class OrchestrationEventNormalizer:
+    def __init__(self, store: SQLiteSessionStore) -> None:
+        self.store = store
+        self._rebased_tool_ids: dict[tuple[str, str], str] = {}
+        self._rebased_counters: dict[str, int] = {}
+
+    def plan_update(self, snapshot: SessionSnapshot, tasks: list[PlanTask]) -> dict[str, Any]:
+        return {
+            "sessionUpdate": "plan",
+            "session_id": snapshot.session_id,
+            "plan": [task.to_dict() for task in tasks],
+            "globalPlan": [task.to_acp_plan_item() for task in tasks],
+            "planning": dict(snapshot.metadata.get("planning", {})),
+        }
+
+    def tool_call_update(
+        self,
+        snapshot: SessionSnapshot,
+        task: PlanTask,
+        event: ToolEvent,
+        *,
+        include_task: bool = True,
+    ) -> dict[str, Any]:
+        payload = {
+            "sessionUpdate": "tool_call",
+            "session_id": snapshot.session_id,
+            "tool_call": event.to_dict(),
+            "toolCall": event.to_acp_tool_call(),
+            "globalPlan": [plan_task.to_acp_plan_item() for plan_task in self._current_plan(snapshot)],
+        }
+        if include_task:
+            payload["task"] = task.to_dict()
+        return payload
+
+    def normalize_worker_updates(
+        self,
+        *,
+        snapshot: SessionSnapshot,
+        task: PlanTask,
+        agent: DownstreamAgentConfig,
+        updates: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for index, update in enumerate(updates):
+            tool_call_id = self._resolve_tool_call_id(task, update, index=index)
+            locations = self._extract_locations(update)
+            terminal = self._extract_terminal(update)
+            if terminal is not None:
+                mapping = TerminalMapping(
+                    upstream_terminal_id=terminal["terminalId"],
+                    downstream_terminal_id=str(terminal.get("downstreamTerminalId") or terminal["terminalId"]),
+                    owner_task_id=task.task_id,
+                    owner_agent_id=agent.agent_id,
+                    metadata={"source_update": update},
+                )
+                self.store.persist_terminal_event(snapshot.session_id, mapping)
+                snapshot.terminal_mappings = [
+                    current
+                    for current in snapshot.terminal_mappings
+                    if not (
+                        current.upstream_terminal_id == mapping.upstream_terminal_id
+                        and current.downstream_terminal_id == mapping.downstream_terminal_id
+                    )
+                ]
+                snapshot.terminal_mappings.append(mapping)
+            content = self._extract_text(update)
+            if not content and not locations and terminal is None:
+                continue
+            event = ToolEvent(
+                tool_call_id=tool_call_id,
+                title=task.title,
+                kind="delegate",
+                status=TaskStatus.IN_PROGRESS,
+                content=content,
+                locations=locations,
+                terminal=terminal,
+                metadata={
+                    "taskId": task.task_id,
+                    "source": "downstream_session_update",
+                    "workerAgentId": agent.agent_id,
+                    "rawUpdate": update,
+                },
+            )
+            normalized.append(self.tool_call_update(snapshot, task, event))
+        return normalized
+
+    def message_update(
+        self,
+        snapshot: SessionSnapshot,
+        summary: str,
+        result: dict[str, object],
+        tasks: list[PlanTask],
+    ) -> dict[str, Any]:
+        blocks = [{"type": "text", "text": summary}]
+        for task in tasks:
+            if task.output:
+                blocks.append({"type": "text", "text": f"{task.title}: {task.output}"})
+        return {
+            "sessionUpdate": "message",
+            "session_id": snapshot.session_id,
+            "message": {
+                "role": "assistant",
+                "content": blocks,
+            },
+            "result": result,
+        }
+
+    def delegate_started_event(self, task: PlanTask) -> ToolEvent:
+        return ToolEvent(
+            tool_call_id=self._orchestrator_tool_id(task),
+            title=task.title,
+            kind="delegate",
+            status=TaskStatus.IN_PROGRESS,
+            content=f"Delegating to {task.assignee}.",
+            metadata={"taskId": task.task_id, "source": "orchestrator"},
+        )
+
+    def delegate_finished_event(self, task: PlanTask, *, status: TaskStatus, content: str) -> ToolEvent:
+        return ToolEvent(
+            tool_call_id=self._orchestrator_tool_id(task),
+            title=task.title,
+            kind="delegate",
+            status=status,
+            content=content,
+            metadata={"taskId": task.task_id, "source": "orchestrator"},
+        )
+
+    def _current_plan(self, snapshot: SessionSnapshot) -> list[PlanTask]:
+        return [task_state.apply_to_plan_task() for task_state in snapshot.task_states]
+
+    def _orchestrator_tool_id(self, task: PlanTask) -> str:
+        return f"orch-tool-{task.task_id}"
+
+    def _resolve_tool_call_id(self, task: PlanTask, update: dict[str, Any], *, index: int) -> str:
+        downstream_id = self._extract_tool_call_id(update)
+        if not downstream_id:
+            return self._orchestrator_tool_id(task)
+        key = (task.task_id, downstream_id)
+        if key not in self._rebased_tool_ids:
+            next_value = self._rebased_counters.get(task.task_id, 0) + 1
+            self._rebased_counters[task.task_id] = next_value
+            self._rebased_tool_ids[key] = f"{self._orchestrator_tool_id(task)}:worker-{next_value}"
+        return self._rebased_tool_ids[key]
+
+    def _extract_tool_call_id(self, payload: Any) -> str | None:
+        if isinstance(payload, dict):
+            for key in ("toolCallId", "tool_call_id", "id"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    return value
+            for nested_key in ("tool_call", "toolCall", "message", "update"):
+                nested = self._extract_tool_call_id(payload.get(nested_key))
+                if nested:
+                    return nested
+            for value in payload.values():
+                nested = self._extract_tool_call_id(value)
+                if nested:
+                    return nested
+        if isinstance(payload, list):
+            for item in payload:
+                nested = self._extract_tool_call_id(item)
+                if nested:
+                    return nested
+        return None
+
+    def _extract_locations(self, payload: Any) -> list[dict[str, Any]]:
+        found: list[dict[str, Any]] = []
+        self._collect_locations(payload, found)
+        unique: list[dict[str, Any]] = []
+        seen: set[tuple[tuple[str, Any], ...]] = set()
+        for location in found:
+            key = tuple(sorted(location.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(location)
+        return unique
+
+    def _collect_locations(self, payload: Any, found: list[dict[str, Any]]) -> None:
+        if isinstance(payload, dict):
+            locations = payload.get("locations")
+            if isinstance(locations, list):
+                for item in locations:
+                    if isinstance(item, dict):
+                        found.append(dict(item))
+            location = payload.get("location")
+            if isinstance(location, dict):
+                found.append(dict(location))
+            path = payload.get("path")
+            if isinstance(path, str) and path:
+                candidate = {"path": path}
+                if isinstance(payload.get("line"), int):
+                    candidate["line"] = payload["line"]
+                found.append(candidate)
+            for value in payload.values():
+                self._collect_locations(value, found)
+        elif isinstance(payload, list):
+            for item in payload:
+                self._collect_locations(item, found)
+
+    def _extract_terminal(self, payload: Any) -> dict[str, Any] | None:
+        if isinstance(payload, dict):
+            candidate = payload.get("terminal") or payload.get("terminal_output") or payload.get("terminalOutput")
+            if isinstance(candidate, dict):
+                terminal_id = candidate.get("terminalId") or candidate.get("terminal_id") or candidate.get("id")
+                content = candidate.get("content") or candidate.get("text") or candidate.get("output")
+                if isinstance(terminal_id, str) and terminal_id and isinstance(content, str):
+                    return {
+                        "terminalId": f"up-{terminal_id}",
+                        "downstreamTerminalId": terminal_id,
+                        "content": content,
+                    }
+            for value in payload.values():
+                terminal = self._extract_terminal(value)
+                if terminal is not None:
+                    return terminal
+        elif isinstance(payload, list):
+            for item in payload:
+                terminal = self._extract_terminal(item)
+                if terminal is not None:
+                    return terminal
+        return None
+
+    def _extract_text(self, payload: Any) -> str:
+        if isinstance(payload, str):
+            return payload
+        if isinstance(payload, dict):
+            text = payload.get("text")
+            if isinstance(text, str) and text:
+                return text
+            for key in ("content", "message"):
+                extracted = self._extract_text(payload.get(key))
+                if extracted:
+                    return extracted
+            return ""
+        if isinstance(payload, list):
+            parts = [self._extract_text(item) for item in payload]
+            return "\n".join(part for part in parts if part)
+        return ""
 
 
 class Orchestrator:
@@ -38,6 +281,7 @@ class Orchestrator:
         self.store = store or SQLiteSessionStore()
         self.connector_manager = connector_manager or DownstreamConnectorManager(agents)
         self.scheduler = Scheduler()
+        self.normalizer = OrchestrationEventNormalizer(self.store)
 
     def create_session(self, cwd: str, selected_model: str | None = None) -> SessionSnapshot:
         normalized_cwd = str(Path(cwd).resolve())
@@ -89,8 +333,14 @@ class Orchestrator:
             return self.set_selected_model(session_id, selected_model)
         return snapshot
 
-    def orchestrate(self, session_id: str, user_prompt: str) -> dict[str, object]:
-        return self.orchestrate_turn(session_id, user_prompt)
+    def orchestrate(
+        self,
+        session_id: str,
+        user_prompt: str,
+        *,
+        emit_update: SessionUpdateCallback | None = None,
+    ) -> None:
+        self._execute_turn(session_id, user_prompt, emit_update=emit_update)
 
     def orchestrate_turn(
         self,
@@ -98,6 +348,24 @@ class Orchestrator:
         user_prompt: str,
         *,
         emit_update: SessionUpdateCallback | None = None,
+    ) -> dict[str, object]:
+        updates: list[dict[str, Any]] = []
+
+        def collector(update: dict[str, Any]) -> None:
+            updates.append(update)
+            if emit_update is not None:
+                emit_update(update)
+
+        result = self._execute_turn(session_id, user_prompt, emit_update=collector)
+        result["updates"] = updates
+        return result
+
+    def _execute_turn(
+        self,
+        session_id: str,
+        user_prompt: str,
+        *,
+        emit_update: SessionUpdateCallback | None,
     ) -> dict[str, object]:
         snapshot = self._require_session(session_id)
         if not snapshot.selected_model:
@@ -122,7 +390,7 @@ class Orchestrator:
         for task_state in snapshot.task_states:
             self.store.persist_task_update(snapshot.session_id, task_state)
         self.store.save(snapshot)
-        self._emit_plan_update(snapshot, plan, emit_update)
+        self._emit_update(self.normalizer.plan_update(snapshot, plan), emit_update)
 
         tool_events = self._run_tasks(
             snapshot=snapshot,
@@ -149,10 +417,11 @@ class Orchestrator:
             },
             "planning": planner_record,
             "plan": [task.to_dict() for task in plan],
+            "global_plan": [task.to_acp_plan_item() for task in plan],
             "tool_events": [event.to_dict() for event in tool_events],
             "summary": summary,
         }
-        self._emit_message_update(snapshot, summary, result, emit_update)
+        self._emit_update(self.normalizer.message_update(snapshot, summary, result, plan), emit_update)
         return result
 
     def _refresh_catalog_for_model(self, composite_model: str) -> None:
@@ -243,15 +512,10 @@ class Orchestrator:
             task_state.dependency_state = "blocked" if task.dependency_ids else "ready"
             self.store.persist_task_update(snapshot.session_id, task_state)
             snapshot.upsert_task_state(task_state)
-            started_event = ToolEvent(
-                tool_call_id=task.task_id,
-                title=task.title,
-                kind="delegate",
-                status=TaskStatus.IN_PROGRESS,
-                content=f"Delegating to {task.assignee}.",
-            )
+            self._emit_update(self.normalizer.plan_update(snapshot, tasks), emit_update)
+            started_event = self.normalizer.delegate_started_event(task)
             events.append(started_event)
-            self._emit_tool_call_update(snapshot, task, started_event, emit_update)
+            self._emit_update(self.normalizer.tool_call_update(snapshot, task, started_event), emit_update)
             agent = agents_by_id[task.assignee or coordinator_agent.agent_id]
             result = self.connector_manager.execute_task(
                 session=snapshot,
@@ -274,6 +538,14 @@ class Orchestrator:
                         metadata={"agent_id": agent.agent_id, "negotiated": negotiated},
                     ),
                 )
+            rebased_updates = self.normalizer.normalize_worker_updates(
+                snapshot=snapshot,
+                task=task,
+                agent=agent,
+                updates=result.metadata.get("updates", []),
+            )
+            for update in rebased_updates:
+                self._emit_update(update, emit_update)
             task.status = result.status
             task.output = result.summary
             task_state = snapshot.get_task_state(task.task_id) or TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id)
@@ -292,15 +564,10 @@ class Orchestrator:
             )
             self.store.persist_task_update(snapshot.session_id, task_state)
             snapshot.upsert_task_state(task_state)
-            finished_event = ToolEvent(
-                tool_call_id=task.task_id,
-                title=task.title,
-                kind="delegate",
-                status=result.status,
-                content=result.summary,
-            )
+            self._emit_update(self.normalizer.plan_update(snapshot, tasks), emit_update)
+            finished_event = self.normalizer.delegate_finished_event(task, status=result.status, content=result.summary)
             events.append(finished_event)
-            self._emit_tool_call_update(snapshot, task, finished_event, emit_update)
+            self._emit_update(self.normalizer.tool_call_update(snapshot, task, finished_event), emit_update)
         return events
 
     def _coordinator_instruction(self, user_prompt: str) -> str:
@@ -342,61 +609,10 @@ class Orchestrator:
             """
         ).strip()
 
-    def _emit_plan_update(
-        self,
-        snapshot: SessionSnapshot,
-        tasks: list[PlanTask],
-        emit_update: SessionUpdateCallback | None,
-    ) -> None:
+    def _emit_update(self, update: dict[str, Any], emit_update: SessionUpdateCallback | None) -> None:
         if emit_update is None:
             return
-        emit_update(
-            {
-                "sessionUpdate": "plan",
-                "session_id": snapshot.session_id,
-                "plan": [task.to_dict() for task in tasks],
-                "planning": dict(snapshot.metadata.get("planning", {})),
-            }
-        )
-
-    def _emit_tool_call_update(
-        self,
-        snapshot: SessionSnapshot,
-        task: PlanTask,
-        event: ToolEvent,
-        emit_update: SessionUpdateCallback | None,
-    ) -> None:
-        if emit_update is None:
-            return
-        emit_update(
-            {
-                "sessionUpdate": "tool_call",
-                "session_id": snapshot.session_id,
-                "task": task.to_dict(),
-                "tool_call": event.to_dict(),
-            }
-        )
-
-    def _emit_message_update(
-        self,
-        snapshot: SessionSnapshot,
-        summary: str,
-        result: dict[str, object],
-        emit_update: SessionUpdateCallback | None,
-    ) -> None:
-        if emit_update is None:
-            return
-        emit_update(
-            {
-                "sessionUpdate": "message",
-                "session_id": snapshot.session_id,
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": summary}],
-                },
-                "result": result,
-            }
-        )
+        emit_update(update)
 
     def _final_summary(self, tasks: list[PlanTask]) -> str:
         completed = [task for task in tasks if task.status == TaskStatus.COMPLETED]

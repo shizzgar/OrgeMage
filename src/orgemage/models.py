@@ -129,6 +129,24 @@ class PlanTask:
         payload["status"] = self.status.value
         return payload
 
+    def to_acp_plan_item(self) -> dict[str, Any]:
+        return {
+            "id": self.task_id,
+            "title": self.title,
+            "details": self.details,
+            "status": self.status.value,
+            "priority": self.priority,
+            "dependencies": list(self.dependency_ids),
+            "assignee": self.assignee,
+            "acceptableModels": list(self.acceptable_models),
+            "requiredCapabilities": dict(self.required_capabilities),
+            "_meta": {
+                **dict(self._meta),
+                "assigneeHints": list(self.assignee_hints),
+                "output": self.output,
+            },
+        }
+
 
 @dataclass(slots=True)
 class ToolEvent:
@@ -138,9 +156,11 @@ class ToolEvent:
     status: TaskStatus
     content: str = ""
     locations: list[dict[str, Any]] = field(default_factory=list)
+    terminal: dict[str, Any] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "toolCallId": self.tool_call_id,
             "title": self.title,
             "kind": self.kind,
@@ -148,6 +168,25 @@ class ToolEvent:
             "content": self.content,
             "locations": self.locations,
         }
+        if self.terminal is not None:
+            payload["terminal"] = dict(self.terminal)
+        if self.metadata:
+            payload["metadata"] = dict(self.metadata)
+        return payload
+
+    def to_acp_tool_call(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "toolCallId": self.tool_call_id,
+            "title": self.title,
+            "kind": self.kind,
+            "status": self.status.value,
+            "content": ([{"type": "text", "text": self.content}] if self.content else []),
+            "locations": [dict(location) for location in self.locations],
+            "_meta": dict(self.metadata),
+        }
+        if self.terminal is not None:
+            payload["terminal"] = dict(self.terminal)
+        return payload
 
 
 @dataclass(slots=True)

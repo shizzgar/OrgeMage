@@ -73,7 +73,7 @@ def test_orchestrator_uses_local_fallback_when_planner_output_is_invalid(tmp_pat
         return result
 
     orchestrator.connector_manager.execute_task = invalid_execute_task  # type: ignore[method-assign]
-    result = orchestrator.orchestrate(session.session_id, "Inspect and update the orchestrator.")
+    result = orchestrator.orchestrate_turn(session.session_id, "Inspect and update the orchestrator.")
 
     assert result["planning"]["normalized_plan"]["_meta"]["source"] == "local_fallback"
     assert result["planning"]["normalized_plan"]["_meta"]["synthesized_locally"] is True
