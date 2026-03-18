@@ -62,8 +62,16 @@ class _FakeConnection:
         self.state.setdefault("new_session_calls", []).append({"cwd": cwd, "mcp_servers": mcp_servers})
         return _FakePayload(
             session_id="downstream-session",
-            config_options=[{"id": "model", "type": "select"}],
+            config_options=[
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "options": [{"value": "gpt-5-codex", "name": "GPT-5 Codex"}],
+                }
+            ],
             modes=["default"],
+            commands=["read", "edit"],
         )
 
     async def load_session(self, cwd: str, mcp_servers: list[object], session_id: str):
@@ -72,8 +80,16 @@ class _FakeConnection:
         )
         return _FakePayload(
             session_id=session_id,
-            config_options=[{"id": "model", "type": "select"}],
+            config_options=[
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "options": [{"value": "gpt-5-codex", "name": "GPT-5 Codex"}],
+                }
+            ],
             modes=["resumed"],
+            commands=["read", "edit", "test"],
         )
 
     async def set_config_option(self, session_id: str, option_id: str, value: str):
@@ -148,6 +164,7 @@ def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_canc
     connector = AcpDownstreamConnector(agent)
     task = PlanTask(title="Implement", details="Details", assignee="codex")
 
+    catalog = connector.discover_catalog()
     first = connector.execute_task(
         orchestrator_session_id="orch-1",
         downstream_session_id=None,
@@ -167,6 +184,8 @@ def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_canc
     connector.cancel(first.downstream_session_id)
     connector.close()
 
+    assert catalog["config_options"][0]["category"] == "model"
+    assert catalog["command_advertisements"] == ["read", "edit"]
     assert first.status is TaskStatus.COMPLETED
     assert first.downstream_session_id == "downstream-session"
     assert first.summary == "final response"
@@ -174,8 +193,8 @@ def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_canc
     assert second.downstream_session_id == "downstream-session"
     assert state["spawn_calls"] == [{"command": "codex", "args": ["--acp"]}]
     assert len(state["initialize_calls"]) == 1
-    assert len(state["new_session_calls"]) == 1
-    assert len(state["load_session_calls"]) == 1
+    assert len(state["new_session_calls"]) == 2
+    assert len(state["load_session_calls"]) == 3
     assert state["set_config_option_calls"] == [
         {"session_id": "downstream-session", "option_id": "model", "value": "gpt-5-codex"},
         {"session_id": "downstream-session", "option_id": "model", "value": "gpt-5-codex"},
@@ -186,7 +205,14 @@ def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_canc
     assert connector.negotiated_state.agent_capabilities == {"loadSession": True}
     assert connector.negotiated_state.auth_methods == ["none"]
     assert connector.negotiated_state.session_capabilities["downstream-session"]["modes"] == ["resumed"]
-    assert connector.negotiated_state.config_options["downstream-session"] == [{"id": "model", "type": "select"}]
+    assert connector.negotiated_state.config_options["downstream-session"] == [
+        {
+            "id": "model",
+            "category": "model",
+            "type": "select",
+            "options": [{"value": "gpt-5-codex", "name": "GPT-5 Codex"}],
+        }
+    ]
 
 
 class _CancelRecordingConnector:
@@ -194,6 +220,24 @@ class _CancelRecordingConnector:
         self.agent = agent
         self.negotiated_state = None
         self.cancelled: list[str] = []
+
+    def discover_catalog(self, *, force: bool = False):
+        return {
+            "agent_id": self.agent.agent_id,
+            "config_options": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "options": [{"value": "gpt-5-codex", "name": "GPT-5 Codex"}],
+                }
+            ],
+            "capabilities": {},
+            "command_advertisements": [],
+        }
+
+    def mark_catalog_refresh_required(self) -> None:
+        return None
 
     def execute_task(self, **kwargs):  # pragma: no cover - not used in this test
         raise AssertionError("execute_task should not be called")

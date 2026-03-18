@@ -1,4 +1,5 @@
 from orgemage.acp.manager import DownstreamConnectorManager
+from orgemage.catalog import FederatedModelCatalog
 from orgemage.models import DownstreamAgentConfig, ModelOption, PlanTask, SessionSnapshot, TaskStatus
 from orgemage.models import DownstreamNegotiatedState
 from orgemage.acp.downstream_client import DownstreamPromptResult
@@ -13,7 +14,28 @@ class RecordingConnector:
             agent_capabilities={"loadSession": True},
             auth_methods=["none"],
         )
-        self.calls: list[dict[str, str | None]] = []
+        self.calls: list[dict[str, str | None | bool]] = []
+
+    def discover_catalog(self, *, force: bool = False):
+        self.calls.append({"discover": self.agent.agent_id, "force": force})
+        return {
+            "agent_id": self.agent.agent_id,
+            "config_options": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "options": [
+                        {"value": "discovered-model", "name": "Discovered Model"},
+                    ],
+                }
+            ],
+            "capabilities": {"commands": ["read", "edit"]},
+            "command_advertisements": ["read", "edit"],
+        }
+
+    def mark_catalog_refresh_required(self) -> None:
+        self.calls.append({"mark_refresh": self.agent.agent_id})
 
     def execute_task(self, **kwargs):
         self.calls.append(
@@ -79,3 +101,20 @@ def test_connector_manager_caches_connectors_and_persists_session_mapping() -> N
     assert session.metadata["downstream_negotiated"]["codex"]["agent_info"] == {"name": "Codex"}
     assert created[0].calls[0]["downstream_session_id"] is None
     assert created[0].calls[1]["downstream_session_id"] == "downstream-codex"
+
+
+def test_connector_manager_refreshes_catalog_from_discovery() -> None:
+    agent = DownstreamAgentConfig(
+        agent_id="codex",
+        name="Codex",
+        command="codex",
+        models=[ModelOption(value="bootstrap-model", name="Bootstrap Model")],
+    )
+    manager = DownstreamConnectorManager([agent], connector_factory=RecordingConnector)
+    catalog = FederatedModelCatalog([agent])
+
+    manager.refresh_catalog(catalog)
+
+    options = catalog.northbound_model_options()
+    assert [item["value"] for item in options] == ["codex::discovered-model"]
+    assert options[0]["metadata"]["source"] == "discovery"
