@@ -159,10 +159,10 @@ def main() -> None:
             _emit({"acp_sdk_available": bridge.sdk_available()})
             return
         try:
-            agent = bridge.create_agent()
+            runtime = bridge.create_runtime()
         except AcpSdkUnavailableError as exc:
             parser.error(str(exc))
-        _emit({"agent": agent.__class__.__name__, "acp_sdk_available": True})
+        _emit({"agent": runtime.agent.__class__.__name__, "runtime": runtime.__class__.__name__, "acp_sdk_available": True})
         return
 
     parser.error(f"Unknown command: {args.command}")

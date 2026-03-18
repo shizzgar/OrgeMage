@@ -162,6 +162,36 @@ class SessionSnapshot:
 
 
 @dataclass(slots=True)
+class SessionHistoryEntry:
+    session_id: str
+    title: str
+    cwd: str
+    selected_model: str | None
+    coordinator_agent_id: str | None
+    created_at: float
+    updated_at: float
+    task_count: int
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_snapshot(cls, snapshot: SessionSnapshot) -> "SessionHistoryEntry":
+        return cls(
+            session_id=snapshot.session_id,
+            title=snapshot.title,
+            cwd=snapshot.cwd,
+            selected_model=snapshot.selected_model,
+            coordinator_agent_id=snapshot.coordinator_agent_id,
+            created_at=snapshot.created_at,
+            updated_at=snapshot.updated_at,
+            task_count=len(snapshot.task_graph),
+            metadata=dict(snapshot.metadata),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
 class WorkerResult:
     task_id: str
     agent_id: str
