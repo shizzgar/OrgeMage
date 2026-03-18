@@ -17,8 +17,11 @@ class Scheduler:
         coordinator = by_id[coordinator_agent_id]
 
         for task in tasks:
-            if task.assignee:
+            if task.assignee and task.assignee in by_id:
+                assignments[task.assignee] += 1
                 continue
+            if task.assignee and task.assignee not in by_id:
+                task.assignee = None
             candidates = self._candidate_agents(task, agents, coordinator)
             candidates.sort(
                 key=lambda agent: (
@@ -42,10 +45,17 @@ class Scheduler:
         if task.acceptable_models:
             allowed = set(task.acceptable_models)
             filtered = [
-                agent for agent in agents if any(model.value in allowed for model in agent.models)
+                agent
+                for agent in agents
+                if agent.agent_id in allowed or any(model.value in allowed or f"{agent.agent_id}::{model.value}" in allowed for model in agent.models)
             ]
             if filtered:
                 return filtered
+        if task.assignee_hints:
+            hinted_ids = {hint for hint in task.assignee_hints if hint in {agent.agent_id for agent in agents}}
+            hinted = [agent for agent in agents if agent.agent_id in hinted_ids]
+            if hinted:
+                return hinted
         needs_complex_reasoning = task.required_capabilities.get("planner")
         if needs_complex_reasoning:
             return [coordinator]

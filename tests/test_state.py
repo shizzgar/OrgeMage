@@ -66,6 +66,8 @@ def test_sqlite_session_store_round_trip_with_runtime_state(tmp_path: Path) -> N
         "required_capabilities": {},
         "acceptable_models": [],
         "dependency_ids": [],
+        "assignee_hints": [],
+        "_meta": {},
         "assignee": "codex",
         "task_id": "t1",
         "priority": 0,
