@@ -1,27 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
 
 from .models import DownstreamAgentConfig, PlanTask, TaskStatus, WorkerResult
 
 
-class DownstreamClient(Protocol):
-    def execute_task(
-        self,
-        *,
-        session_id: str,
-        task: PlanTask,
-        coordinator_prompt: str,
-        selected_model: str,
-        agent: DownstreamAgentConfig,
-    ) -> WorkerResult:
-        ...
-
-
 @dataclass(slots=True)
 class MockDownstreamClient:
-    """Deterministic stand-in used for local development and testing."""
+    """Deterministic stand-in used only for explicit dev/test fallback runs."""
 
     def execute_task(
         self,

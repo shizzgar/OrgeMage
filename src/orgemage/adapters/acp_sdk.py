@@ -40,23 +40,17 @@ class AcpSdkBridge:
 
             async def new_session(self, cwd: str, **kwargs: Any) -> Any:
                 session = orchestrator.create_session(cwd)
-                config_options = [
-                    acp.ConfigOption(
-                        id="model",
-                        name="Coordinator model",
-                        category="model",
-                        type="select",
-                        options=[
-                            acp.ConfigOptionValue(
-                                value=option["value"],
-                                name=option["name"],
-                                description=option["description"],
-                            )
-                            for option in orchestrator.list_model_options()
-                        ],
-                    )
-                ]
-                return acp.NewSessionResponse(session_id=session.session_id, config_options=config_options)
+                return acp.NewSessionResponse(
+                    session_id=session.session_id,
+                    config_options=_model_config_options(acp, orchestrator),
+                )
+
+            async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> Any:
+                snapshot = orchestrator.load_session(session_id, selected_model=kwargs.get("model"))
+                return acp.LoadSessionResponse(
+                    session_id=snapshot.session_id,
+                    config_options=_model_config_options(acp, orchestrator),
+                )
 
             async def set_config_option(self, session_id: str, option_id: str, value: str, **kwargs: Any) -> Any:
                 if option_id == "model":
@@ -68,7 +62,30 @@ class AcpSdkBridge:
                 result = orchestrator.orchestrate(session_id, text)
                 return acp.PromptResponse(
                     stop_reason="end_turn",
-                    message=acp.Message(content=[acp.TextBlock(text=result["summary"])])
+                    message=acp.Message(content=[acp.TextBlock(text=result["summary"])]),
                 )
 
+            async def cancel(self, session_id: str, **kwargs: Any) -> Any:
+                orchestrator.cancel(session_id)
+                return None
+
         return OrgeMageAcpAgent()
+
+
+def _model_config_options(acp: Any, orchestrator: Orchestrator) -> list[Any]:
+    return [
+        acp.ConfigOption(
+            id="model",
+            name="Coordinator model",
+            category="model",
+            type="select",
+            options=[
+                acp.ConfigOptionValue(
+                    value=option["value"],
+                    name=option["name"],
+                    description=option["description"],
+                )
+                for option in orchestrator.list_model_options()
+            ],
+        )
+    ]

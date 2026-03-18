@@ -11,7 +11,8 @@ from .orchestrator import Orchestrator
 from .state import SQLiteSessionStore
 
 
-def _default_agents() -> list[DownstreamAgentConfig]:
+def _default_agents(mock_downstream: bool = False) -> list[DownstreamAgentConfig]:
+    runtime = "mock" if mock_downstream else "acp"
     return [
         DownstreamAgentConfig(
             agent_id="codex",
@@ -29,6 +30,7 @@ def _default_agents() -> list[DownstreamAgentConfig]:
             ),
             description="OpenAI coding agent",
             default_model="gpt-5-codex",
+            runtime=runtime,
         ),
         DownstreamAgentConfig(
             agent_id="gemini",
@@ -46,6 +48,7 @@ def _default_agents() -> list[DownstreamAgentConfig]:
             ),
             description="Google Gemini CLI",
             default_model="gemini-2.5-pro",
+            runtime=runtime,
         ),
         DownstreamAgentConfig(
             agent_id="qwen",
@@ -63,18 +66,20 @@ def _default_agents() -> list[DownstreamAgentConfig]:
             ),
             description="Alibaba Qwen Code",
             default_model="qwen3-coder-plus",
+            runtime=runtime,
         ),
     ]
 
 
-def _load_config(path: str | None) -> list[DownstreamAgentConfig]:
+def _load_config(path: str | None, mock_downstream: bool = False) -> list[DownstreamAgentConfig]:
     if path is None:
-        return _default_agents()
+        return _default_agents(mock_downstream=mock_downstream)
     payload = json.loads(Path(path).read_text())
     agents: list[DownstreamAgentConfig] = []
     for item in payload["agents"]:
         capabilities = AgentCapabilities(**item.get("capabilities", {}))
         models = [ModelOption(**model) for model in item.get("models", [])]
+        runtime = "mock" if mock_downstream else item.get("runtime", "acp")
         agents.append(
             DownstreamAgentConfig(
                 agent_id=item["agent_id"],
@@ -85,6 +90,7 @@ def _load_config(path: str | None) -> list[DownstreamAgentConfig]:
                 capabilities=capabilities,
                 description=item.get("description", ""),
                 default_model=item.get("default_model"),
+                runtime=runtime,
                 metadata=item.get("metadata", {}),
             )
         )
@@ -95,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="OrgeMage ACP orchestrator")
     parser.add_argument("--config", help="JSON file describing downstream agents")
     parser.add_argument("--db", default=":memory:", help="SQLite database path")
+    parser.add_argument(
+        "--mock-downstream",
+        action="store_true",
+        help="Use MockDownstreamClient for downstream agents instead of real ACP subprocesses",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("models", help="List federated coordinator models")
@@ -114,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _make_orchestrator(args: argparse.Namespace) -> Orchestrator:
-    agents = _load_config(args.config)
+    agents = _load_config(args.config, mock_downstream=args.mock_downstream)
     return Orchestrator(agents=agents, store=SQLiteSessionStore(args.db))
 
 

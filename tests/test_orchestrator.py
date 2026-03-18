@@ -17,6 +17,7 @@ def _agents() -> list[DownstreamAgentConfig]:
                 supports_filesystem=True,
                 commands=["read", "edit", "test", "search"],
             ),
+            runtime="mock",
         ),
         DownstreamAgentConfig(
             agent_id="qwen",
@@ -28,6 +29,7 @@ def _agents() -> list[DownstreamAgentConfig]:
                 supports_filesystem=True,
                 commands=["edit", "test"],
             ),
+            runtime="mock",
         ),
     ]
 
@@ -43,6 +45,7 @@ def test_orchestrator_selects_coordinator_and_runs_plan(tmp_path: Path) -> None:
     assert all(task["status"] == "completed" for task in result["plan"])
     assert len(result["tool_events"]) == 8
     assert result["summary"] == "Completed 4/4 orchestrated tasks."
+    assert result["session"]["metadata"]["downstream_sessions"]["codex"].startswith("mock-codex-")
 
 
 def test_orchestrator_defaults_to_first_model_if_none_selected(tmp_path: Path) -> None:
