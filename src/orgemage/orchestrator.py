@@ -7,7 +7,18 @@ from typing import Any, Callable
 
 from .acp.manager import DownstreamConnectorManager
 from .catalog import FederatedModelCatalog
-from .models import DownstreamAgentConfig, OrchestrationTurnState, PlanTask, SessionHistoryEntry, SessionSnapshot, TaskExecutionState, TaskStatus, ToolEvent, TraceCorrelationState
+from .models import (
+    DownstreamAgentConfig,
+    OrchestrationTurnState,
+    PlanTask,
+    SessionHistoryEntry,
+    SessionSnapshot,
+    TaskExecutionState,
+    TaskStatus,
+    ToolEvent,
+    TraceCorrelationState,
+)
+from .planning import PlanParseResult, parse_coordinator_plan, synthesize_local_fallback_plan
 from .scheduler import Scheduler
 from .state import SQLiteSessionStore
 
@@ -99,12 +110,20 @@ class Orchestrator:
         snapshot.turns.append(turn)
         self.store.create_or_update_turn_state(snapshot.session_id, turn)
 
-        plan = self._build_plan(user_prompt, resolved.agent.agent_id)
-        plan = self.scheduler.assign_tasks(plan, self.catalog.agents, resolved.agent.agent_id)
+        plan_parse_result, planner_record = self._generate_plan(
+            snapshot=snapshot,
+            selected_model=resolved.option.value,
+            coordinator_agent=resolved.agent,
+            user_prompt=user_prompt,
+            turn=turn,
+        )
+        plan = self.scheduler.assign_tasks(plan_parse_result.tasks, self.catalog.agents, resolved.agent.agent_id)
         snapshot.task_states = [TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id) for task in plan]
         for task_state in snapshot.task_states:
             self.store.persist_task_update(snapshot.session_id, task_state)
+        self.store.save(snapshot)
         self._emit_plan_update(snapshot, plan, emit_update)
+
         tool_events = self._run_tasks(
             snapshot=snapshot,
             selected_model=resolved.option.value,
@@ -117,6 +136,7 @@ class Orchestrator:
         turn.status = "completed"
         turn.stop_reason = "end_turn"
         self.store.create_or_update_turn_state(snapshot.session_id, turn)
+        self.store.save(snapshot)
         snapshot = self._require_session(session_id)
         summary = self._final_summary(plan)
         result = {
@@ -127,13 +147,13 @@ class Orchestrator:
                 "model": resolved.option.value,
                 "composite_model": resolved.composite_value,
             },
+            "planning": planner_record,
             "plan": [task.to_dict() for task in plan],
             "tool_events": [event.to_dict() for event in tool_events],
             "summary": summary,
         }
         self._emit_message_update(snapshot, summary, result, emit_update)
         return result
-
 
     def _refresh_catalog_for_model(self, composite_model: str) -> None:
         agent_id, _, _ = composite_model.partition("::")
@@ -147,39 +167,59 @@ class Orchestrator:
         self.store.save(snapshot)
         return snapshot
 
-    def _build_plan(self, user_prompt: str, coordinator_agent_id: str) -> list[PlanTask]:
-        normalized = user_prompt.strip()
-        title = normalized.splitlines()[0][:72] if normalized else "Orchestration request"
-        return [
-            PlanTask(
-                title="Analyze request and produce execution plan",
-                details=f"Coordinator decomposes the request: {title}",
-                required_capabilities={"planner": True, "needsPermissions": True},
-                assignee=coordinator_agent_id,
-                priority=100,
-            ),
-            PlanTask(
-                title="Inspect repository and gather context",
-                details="Read project files, identify impacted modules, and capture constraints.",
-                required_capabilities={"needsFilesystem": True, "commands": ["read", "search"]},
-                dependency_ids=[],
-                priority=80,
-            ),
-            PlanTask(
-                title="Implement orchestrator changes",
-                details="Edit project files, add code paths, and wire core orchestrator behavior.",
-                required_capabilities={"needsFilesystem": True, "needsTerminal": True, "commands": ["edit", "test"]},
-                dependency_ids=[],
-                priority=70,
-            ),
-            PlanTask(
-                title="Validate behavior",
-                details="Run tests or dry-run validations and summarize execution results.",
-                required_capabilities={"needsTerminal": True, "commands": ["test"]},
-                dependency_ids=[],
-                priority=60,
-            ),
-        ]
+    def _generate_plan(
+        self,
+        *,
+        snapshot: SessionSnapshot,
+        selected_model: str,
+        coordinator_agent: DownstreamAgentConfig,
+        user_prompt: str,
+        turn: OrchestrationTurnState,
+    ) -> tuple[PlanParseResult, dict[str, Any]]:
+        planning_task = PlanTask(
+            title="Generate structured orchestration plan",
+            details="Analyze the user request and return a structured orchestration plan JSON contract.",
+            required_capabilities={"planner": True, "needsPermissions": True},
+            assignee=coordinator_agent.agent_id,
+            priority=100,
+            _meta={"source": "coordinator", "phase": "planning"},
+        )
+        planning_result = self.connector_manager.execute_task(
+            session=snapshot,
+            task=planning_task,
+            coordinator_prompt=self._coordinator_instruction(user_prompt),
+            selected_model=selected_model,
+            agent=coordinator_agent,
+        )
+        raw_output = planning_result.raw_output or planning_result.summary
+        parsed_plan = parse_coordinator_plan(raw_output, coordinator_agent_id=coordinator_agent.agent_id)
+        if not parsed_plan.is_valid:
+            fallback_plan = synthesize_local_fallback_plan(user_prompt, coordinator_agent_id=coordinator_agent.agent_id)
+            fallback_plan.normalized_plan["_meta"]["coordinator_errors"] = list(parsed_plan.errors)
+            plan_parse_result = fallback_plan
+        else:
+            plan_parse_result = parsed_plan
+
+        planner_record = {
+            "raw_coordinator_output": raw_output,
+            "normalized_plan": plan_parse_result.normalized_plan,
+            "planner_task": planning_task.to_dict(),
+            "planner_result": {
+                "status": planning_result.status.value,
+                "summary": planning_result.summary,
+                "metadata": dict(planning_result.metadata),
+            },
+            "validation_errors": list(parsed_plan.errors),
+        }
+        snapshot.metadata["planning"] = planner_record
+        turn.metadata["planning"] = {
+            "source": plan_parse_result.normalized_plan.get("_meta", {}).get("source"),
+            "planner_task_id": planning_task.task_id,
+            "validation_errors": list(parsed_plan.errors),
+        }
+        self.store.create_or_update_turn_state(snapshot.session_id, turn)
+        self.store.save(snapshot)
+        return plan_parse_result, planner_record
 
     def _run_tasks(
         self,
@@ -240,7 +280,16 @@ class Orchestrator:
             task_state.status = result.status
             task_state.output = result.summary
             task_state.assignee = task.assignee
-            task_state.plan_metadata.update({"worker_result": dict(result.metadata)})
+            task_state.plan_metadata.update(
+                {
+                    "assignee_hints": list(task.assignee_hints),
+                    "_meta": dict(task._meta),
+                    "worker_result": {
+                        **dict(result.metadata),
+                        "raw_output": result.raw_output,
+                    },
+                }
+            )
             self.store.persist_task_update(snapshot.session_id, task_state)
             snapshot.upsert_task_state(task_state)
             finished_event = ToolEvent(
@@ -258,8 +307,35 @@ class Orchestrator:
         return textwrap.dedent(
             f"""
             You are the selected coordinator model for OrgeMage.
-            Decompose the request into ACP-native plan entries, choose the best workers,
-            and keep permissions/filesystem/terminal access constrained to the upstream cwd.
+            Your first responsibility is planning: return a structured orchestration plan as JSON.
+            Do not return prose before or after the JSON object.
+
+            Contract:
+            {{
+              "tasks": [
+                {{
+                  "title": "string",
+                  "details": "string",
+                  "dependencies": ["task title dependency"],
+                  "required_capabilities": {{"needsFilesystem": true, "commands": ["read"]}},
+                  "assignee_hints": ["optional-agent-id"],
+                  "acceptable_models": ["optional-agent::model or model"],
+                  "priority": 80,
+                  "_meta": {{"why": "brief provenance or reasoning"}}
+                }}
+              ],
+              "_meta": {{
+                "planner": "coordinator",
+                "provenance": "explain how the plan was produced"
+              }}
+            }}
+
+            Rules:
+            - Every task must include title, details, dependencies, required_capabilities, priority, and _meta.
+            - Dependencies must reference other task titles from the same response.
+            - Keep permissions/filesystem/terminal access constrained to the upstream cwd.
+            - Use assignee_hints and acceptable_models only when you have a concrete reason.
+            - Prefer the smallest task graph that still covers implementation and validation.
 
             User request:
             {user_prompt.strip()}
@@ -279,6 +355,7 @@ class Orchestrator:
                 "sessionUpdate": "plan",
                 "session_id": snapshot.session_id,
                 "plan": [task.to_dict() for task in tasks],
+                "planning": dict(snapshot.metadata.get("planning", {})),
             }
         )
 

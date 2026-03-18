@@ -116,6 +116,8 @@ class PlanTask:
     required_capabilities: dict[str, Any] = field(default_factory=dict)
     acceptable_models: list[str] = field(default_factory=list)
     dependency_ids: list[str] = field(default_factory=list)
+    assignee_hints: list[str] = field(default_factory=list)
+    _meta: dict[str, Any] = field(default_factory=dict)
     assignee: str | None = None
     task_id: str = field(default_factory=lambda: f"task-{uuid.uuid4().hex[:12]}")
     priority: int = 0
@@ -200,6 +202,10 @@ class TaskExecutionState:
             parent_turn_id=parent_turn_id,
             assignee=task.assignee,
             dependency_state="blocked" if task.dependency_ids else "ready",
+            plan_metadata={
+                **({"assignee_hints": list(task.assignee_hints)} if task.assignee_hints else {}),
+                **({"_meta": dict(task._meta)} if task._meta else {}),
+            },
             required_capabilities=dict(task.required_capabilities),
             acceptable_models=list(task.acceptable_models),
             dependency_ids=list(task.dependency_ids),
@@ -215,6 +221,8 @@ class TaskExecutionState:
             required_capabilities=dict(self.required_capabilities),
             acceptable_models=list(self.acceptable_models),
             dependency_ids=list(self.dependency_ids),
+            assignee_hints=list(self.plan_metadata.get("assignee_hints", [])),
+            _meta=dict(self.plan_metadata.get("_meta", {})),
             assignee=self.assignee,
             task_id=self.task_id,
             priority=self.priority,
@@ -311,7 +319,11 @@ class SessionSnapshot:
                     parent_turn_id=task_payload.get("parent_turn_id"),
                     assignee=task_payload.get("assignee"),
                     dependency_state=str(task_payload.get("dependency_state", "blocked" if task_payload.get("dependency_ids") else "ready")),
-                    plan_metadata=dict(task_payload.get("plan_metadata", {})),
+                    plan_metadata={
+                        **dict(task_payload.get("plan_metadata", {})),
+                        **({"assignee_hints": list(task_payload.get("assignee_hints", []))} if task_payload.get("assignee_hints") else {}),
+                        **({"_meta": dict(task_payload.get("_meta", {}))} if task_payload.get("_meta") else {}),
+                    },
                     required_capabilities=dict(task_payload.get("required_capabilities", {})),
                     acceptable_models=list(task_payload.get("acceptable_models", [])),
                     dependency_ids=list(task_payload.get("dependency_ids", [])),
