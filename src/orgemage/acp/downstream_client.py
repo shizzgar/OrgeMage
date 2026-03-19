@@ -32,6 +32,16 @@ class DownstreamConnectorError(RuntimeError):
     """Raised when a downstream ACP connection cannot be established or used."""
 
 
+def _acp_attr(acp: Any, name: str) -> Any:
+    value = getattr(acp, name, None)
+    if value is not None:
+        return value
+    schema = getattr(acp, "schema", None)
+    if schema is not None:
+        return getattr(schema, name, None)
+    return None
+
+
 @dataclass(slots=True)
 class DownstreamPromptResult:
     downstream_session_id: str
@@ -997,18 +1007,33 @@ def _load_sdk() -> _SdkBindings:
             "connectors. Install with `pip install orgemage[acp]` or enable the mock runtime explicitly."
         ) from exc
     try:
-        return _SdkBindings(
+        bindings = _SdkBindings(
             module=acp,
             protocol_version=acp.PROTOCOL_VERSION,
-            client_base=acp.Client,
-            request_error=acp.RequestError,
-            client_capabilities=acp.ClientCapabilities,
-            implementation=acp.Implementation,
+            client_base=_acp_attr(acp, "Client"),
+            request_error=_acp_attr(acp, "RequestError"),
+            client_capabilities=_acp_attr(acp, "ClientCapabilities"),
+            implementation=_acp_attr(acp, "Implementation"),
             spawn_agent_process=acp.spawn_agent_process,
             text_block=acp.text_block,
         )
     except AttributeError as exc:  # pragma: no cover - depends on external runtime
         raise DownstreamConnectorError(f"Installed ACP SDK is missing required API surface: {exc}") from exc
+    required_fields = {
+        "Client": bindings.client_base,
+        "RequestError": bindings.request_error,
+        "ClientCapabilities": bindings.client_capabilities,
+        "Implementation": bindings.implementation,
+        "spawn_agent_process": bindings.spawn_agent_process,
+        "text_block": bindings.text_block,
+    }
+    missing = [name for name, value in required_fields.items() if value is None]
+    if missing:  # pragma: no cover - depends on external runtime
+        raise DownstreamConnectorError(
+            "Installed ACP SDK is missing required API surface: "
+            + ", ".join(f"module acp has no attribute {name}" for name in missing)
+        )
+    return bindings
 
 
 def _build_runtime_client(
