@@ -102,7 +102,7 @@ class AcpAgentRuntime:
             mcp_servers=_extract_mcp_servers(kwargs),
         )
         response = _build_new_session_response(self.acp, session.session_id, self.orchestrator)
-        self._schedule_session_info_update(session.session_id)
+        self._schedule_startup_updates(session.session_id)
         return response
 
     async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> Any:
@@ -113,7 +113,7 @@ class AcpAgentRuntime:
             mcp_servers=_extract_mcp_servers(kwargs),
         )
         response = _build_load_session_response(self.acp, snapshot.session_id, self.orchestrator)
-        self._schedule_session_info_update(snapshot.session_id)
+        self._schedule_startup_updates(snapshot.session_id)
         return response
 
     async def list_sessions(self, **kwargs: Any) -> Any:
@@ -159,6 +159,9 @@ class AcpAgentRuntime:
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> Any:
         prompt_metadata = extract_prompt_metadata(prompt, **kwargs)
         text = "\n".join(getattr(block, "text", str(block)) for block in prompt)
+        slash_command_response = await self._maybe_handle_slash_command(session_id, text)
+        if slash_command_response is not None:
+            return slash_command_response
         loop = asyncio.get_running_loop()
 
         def emit_update(update: dict[str, Any]) -> None:
@@ -242,16 +245,55 @@ class AcpAgentRuntime:
             },
         )
 
-    def _schedule_session_info_update(self, session_id: str) -> None:
+    async def _send_available_commands_update(self, session_id: str) -> None:
+        await self._send_session_update(
+            session_id,
+            {
+                "sessionUpdate": "available_commands",
+                "session_id": session_id,
+                "available_commands": _available_commands(self.orchestrator, session_id=session_id),
+            },
+        )
+
+    def _schedule_startup_updates(self, session_id: str) -> None:
         if self.client_connection is None:
             return
         loop = asyncio.get_running_loop()
         # Mirror the codex-acp startup pattern: send post-response session updates
         # asynchronously so they do not race the NewSessionResponse/LoadSessionResponse path.
-        loop.call_soon(self._start_session_info_update_task, session_id)
+        loop.call_soon(self._start_startup_update_tasks, session_id)
 
-    def _start_session_info_update_task(self, session_id: str) -> None:
+    def _start_startup_update_tasks(self, session_id: str) -> None:
+        self._start_background_task(self._send_available_commands_update(session_id))
         self._start_background_task(self._send_session_info_update(session_id))
+
+    async def _maybe_handle_slash_command(self, session_id: str, text: str) -> Any | None:
+        command_name, command_input = _parse_slash_command(text)
+        if command_name is None:
+            return None
+        handler = _SLASH_COMMAND_HANDLERS.get(command_name)
+        if handler is None:
+            await self._send_agent_message_chunk(
+                session_id,
+                f"Unknown command '/{command_name}'. Available commands: {', '.join(_slash_command_labels())}.",
+            )
+            return self._build_prompt_response("", stop_reason="end_turn")
+        await self._send_agent_message_chunk(
+            session_id,
+            handler(self.orchestrator, session_id=session_id, command_input=command_input),
+        )
+        await self._send_session_info_update(session_id)
+        return self._build_prompt_response("", stop_reason="end_turn")
+
+    async def _send_agent_message_chunk(self, session_id: str, text: str) -> None:
+        await self._send_session_update(
+            session_id,
+            {
+                "sessionUpdate": "message",
+                "session_id": session_id,
+                "message": {"content": [{"type": "text", "text": text}]},
+            },
+        )
 
     def _start_background_task(self, coroutine: Any) -> None:
         task = asyncio.create_task(coroutine)
@@ -464,6 +506,11 @@ def _mode_state(acp: Any, orchestrator: Orchestrator, *, session_id: str | None 
     )
 
 
+def _available_commands(orchestrator: Orchestrator, *, session_id: str | None = None) -> list[dict[str, Any]]:
+    del orchestrator, session_id
+    return [dict(command) for command in _NORTHBOUND_COMMANDS]
+
+
 def _current_model_value(orchestrator: Orchestrator, *, session_id: str | None, options: list[dict[str, Any]]) -> str:
     if session_id is not None:
         selected_model = orchestrator.session_info(session_id).get("selected_model")
@@ -623,6 +670,19 @@ def _session_update_notifications(acp: Any, update: dict[str, Any], *, session_i
                     }
                 )
             )
+    elif session_update == "available_commands":
+        commands = update.get("available_commands") or []
+        commands_type = _acp_attr(acp, "AvailableCommandsUpdate")
+        if commands_type is not None:
+            notifications.append(
+                commands_type.model_validate(
+                    {
+                        "sessionUpdate": "available_commands_update",
+                        "availableCommands": [_available_command_payload(command) for command in commands],
+                        "_meta": {"sessionId": update.get("session_id")},
+                    }
+                )
+            )
     elif session_update == "cancelled":
         chunk_type = _acp_attr(acp, "AgentMessageChunk")
         if chunk_type is not None:
@@ -655,3 +715,93 @@ def _config_option_payload(option: Any) -> dict[str, Any]:
     if "current_value" in payload and "currentValue" not in payload:
         payload["currentValue"] = payload.pop("current_value")
     return payload
+
+
+def _available_command_payload(command: Any) -> dict[str, Any]:
+    payload = dict(command) if isinstance(command, dict) else dict(getattr(command, "__dict__", {}))
+    input_payload = payload.get("input")
+    if input_payload is None:
+        payload.pop("input", None)
+    elif not isinstance(input_payload, dict):
+        payload["input"] = dict(getattr(input_payload, "__dict__", {}))
+    return payload
+
+
+def _parse_slash_command(text: str) -> tuple[str | None, str]:
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None, ""
+    name, _, remainder = stripped[1:].partition(" ")
+    normalized_name = name.strip().lower()
+    if not normalized_name:
+        return None, ""
+    return normalized_name, remainder.strip()
+
+
+def _format_status_command(orchestrator: Orchestrator, *, session_id: str, command_input: str) -> str:
+    del command_input
+    info = orchestrator.session_info(session_id)
+    return (
+        f"Session {info['session_id']}\n"
+        f"Title: {info.get('title') or 'Untitled'}\n"
+        f"Mode: {info.get('current_mode_id') or orchestrator.DEFAULT_SESSION_MODE}\n"
+        f"Model: {info.get('selected_model') or 'Not selected'}\n"
+        f"Tasks: {info.get('task_count', 0)}\n"
+        f"Summary: {info.get('summary') or 'No completed turn yet.'}"
+    )
+
+
+def _format_models_command(orchestrator: Orchestrator, *, session_id: str, command_input: str) -> str:
+    del session_id, command_input
+    options = orchestrator.list_model_options(refresh=False)
+    if not options:
+        return "No coordinator models are currently available."
+    lines = ["Available coordinator models:"]
+    for option in options:
+        lines.append(f"- {option['value']}: {option['name']}")
+    return "\n".join(lines)
+
+
+def _format_plan_command(orchestrator: Orchestrator, *, session_id: str, command_input: str) -> str:
+    del command_input
+    snapshot = orchestrator.load_session(session_id)
+    plan = snapshot.task_graph
+    if not plan:
+        return "No active orchestration plan is available for this session yet."
+    lines = ["Current orchestration plan:"]
+    for index, task in enumerate(plan, start=1):
+        task_id = task.get("task_id") or f"task-{index}"
+        title = task.get("title") or task_id
+        status = task.get("status") or "pending"
+        assignee = task.get("assignee")
+        line = f"{index}. [{status}] {title}"
+        if assignee:
+            line += f" (assignee: {assignee})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _slash_command_labels() -> list[str]:
+    return [f"/{command['name']}" for command in _NORTHBOUND_COMMANDS]
+
+
+_NORTHBOUND_COMMANDS: tuple[dict[str, Any], ...] = (
+    {
+        "name": "status",
+        "description": "Show the current OrgeMage session status, model, mode, and summary.",
+    },
+    {
+        "name": "models",
+        "description": "List the coordinator models currently exposed by OrgeMage.",
+    },
+    {
+        "name": "plan",
+        "description": "Show the current orchestration plan for this session.",
+    },
+)
+
+_SLASH_COMMAND_HANDLERS = {
+    "status": _format_status_command,
+    "models": _format_models_command,
+    "plan": _format_plan_command,
+}

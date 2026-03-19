@@ -168,6 +168,11 @@ class _FakeModernAcp:
         def model_validate(cls, payload: dict[str, object]) -> object:
             return SimpleNamespace(**payload)
 
+    class AvailableCommandsUpdate:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
     class AgentPlanUpdate:
         @classmethod
         def model_validate(cls, payload: dict[str, object]) -> object:
@@ -402,7 +407,11 @@ def test_acp_runtime_new_and_load_session_return_before_startup_update_delivery(
 
         await asyncio.wait_for(connection.started.wait(), timeout=1)
         assert connection.updates[0][0] == created.session_id
-        assert connection.updates[0][1]["sessionUpdate"] == "session_info"
+        assert connection.updates[0][1]["sessionUpdate"] in {"available_commands", "session_info"}
+        assert {update["sessionUpdate"] for _, update in connection.updates} >= {
+            "available_commands",
+            "session_info",
+        }
 
         loaded_connection = _BlockingSessionUpdateConnection()
         runtime.bind_client_connection(loaded_connection)
@@ -414,7 +423,11 @@ def test_acp_runtime_new_and_load_session_return_before_startup_update_delivery(
 
         await asyncio.wait_for(loaded_connection.started.wait(), timeout=1)
         assert loaded_connection.updates[0][0] == created.session_id
-        assert loaded_connection.updates[0][1]["sessionUpdate"] == "session_info"
+        assert loaded_connection.updates[0][1]["sessionUpdate"] in {"available_commands", "session_info"}
+        assert {update["sessionUpdate"] for _, update in loaded_connection.updates} >= {
+            "available_commands",
+            "session_info",
+        }
 
         connection.release.set()
         loaded_connection.release.set()
@@ -494,7 +507,14 @@ def test_acp_stdio_session_new_returns_before_blocked_startup_update(tmp_path: P
             assert isinstance(session_id, str) and session_id.startswith("orch-")
 
             assert client.updates
-            assert getattr(client.updates[0][1], "sessionUpdate", None) == "session_info_update"
+            assert getattr(client.updates[0][1], "sessionUpdate", None) in {
+                "available_commands_update",
+                "session_info_update",
+            }
+            assert {
+                getattr(update, "sessionUpdate", None)
+                for _, update in client.updates
+            } >= {"available_commands_update", "session_info_update"}
 
             client.release.set()
             await asyncio.sleep(0)
@@ -645,12 +665,17 @@ def test_acp_runtime_supports_modern_acp_schema_shapes(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
     kinds = [getattr(update, "sessionUpdate", None) for _, update in connection.updates]
+    assert "available_commands_update" in kinds
     assert "session_info_update" in kinds
     assert "config_option_update" in kinds
     assert "current_mode_update" in kinds
     assert "plan" in kinds
     assert "tool_call" in kinds
     assert "agent_message_chunk" in kinds
+    available_command_updates = [
+        update for _, update in connection.updates if getattr(update, "sessionUpdate", None) == "available_commands_update"
+    ]
+    assert [command["name"] for command in available_command_updates[-1].availableCommands] == ["status", "models", "plan"]
 
 
 def test_acp_runtime_mode_round_trip_and_updates(tmp_path: Path) -> None:
@@ -668,10 +693,38 @@ def test_acp_runtime_mode_round_trip_and_updates(tmp_path: Path) -> None:
 
         loaded = await runtime.load_session(tmp_path.as_posix(), created.session_id)
         assert loaded.modes.current_mode_id == "read-only"
+        await asyncio.sleep(0.05)
 
     asyncio.run(scenario())
 
     kinds = [getattr(update, "sessionUpdate", None) for _, update in connection.updates]
+    assert "available_commands_update" in kinds
     assert "current_mode_update" in kinds
     current_mode_updates = [update for _, update in connection.updates if getattr(update, "sessionUpdate", None) == "current_mode_update"]
     assert current_mode_updates[-1].currentModeId == "read-only"
+
+
+def test_acp_runtime_slash_commands_emit_advertised_native_responses(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    runtime = AcpAgentRuntime(acp=_FakeModernAcp, orchestrator=orchestrator)
+    connection = _RecordingConnection()
+
+    async def scenario() -> str:
+        await runtime.initialize(1, conn=connection)
+        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex")
+        response = await runtime.prompt(created.session_id, [_FakeAcp.TextBlock("/status")])
+        assert response.stop_reason == "end_turn"
+        await runtime.prompt(created.session_id, [_FakeAcp.TextBlock("/models")])
+        await runtime.prompt(created.session_id, [_FakeAcp.TextBlock("/plan")])
+        return created.session_id
+
+    session_id = asyncio.run(scenario())
+
+    chunks = [
+        update.content["text"]
+        for update_session_id, update in connection.updates
+        if update_session_id == session_id and getattr(update, "sessionUpdate", None) == "agent_message_chunk"
+    ]
+    assert any("Session orch-" in chunk for chunk in chunks)
+    assert any("Available coordinator models:" in chunk for chunk in chunks)
+    assert any("No active orchestration plan is available" in chunk for chunk in chunks)
