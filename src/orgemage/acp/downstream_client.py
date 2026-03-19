@@ -5,11 +5,24 @@ from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 import importlib
+import os
+from pathlib import Path
+import subprocess
 import threading
 import time
 from typing import Any, Callable, Protocol
+import uuid
 
-from ..models import DownstreamAgentConfig, DownstreamNegotiatedState, PlanTask, TaskStatus
+from ..models import (
+    DownstreamAgentConfig,
+    DownstreamNegotiatedState,
+    PermissionRequestState,
+    PlanTask,
+    TaskStatus,
+    TerminalMapping,
+    TraceCorrelationState,
+)
+from ..state import SQLiteSessionStore
 
 
 class DownstreamConnectorError(RuntimeError):
@@ -64,6 +77,467 @@ class _SdkBindings:
     text_block: Callable[[str], Any]
 
 
+@dataclass(slots=True)
+class _ExecutionContext:
+    orchestrator_session_id: str
+    downstream_session_id: str
+    cwd: str
+    task: PlanTask
+
+
+class _BufferedTerminalProcess:
+    def __init__(self, terminal_id: str, command: list[str], *, cwd: str, env: dict[str, str]) -> None:
+        self.terminal_id = terminal_id
+        self.command = list(command)
+        self.cwd = cwd
+        self.env = dict(env)
+        self._lock = threading.Lock()
+        self._buffer: list[str] = []
+        self._released = False
+        self.process = subprocess.Popen(
+            self.command,
+            cwd=self.cwd,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        self._reader = threading.Thread(target=self._read_output, name=f"orgemage-terminal-{terminal_id}", daemon=True)
+        self._reader.start()
+
+    def _read_output(self) -> None:
+        assert self.process.stdout is not None
+        for chunk in self.process.stdout:
+            with self._lock:
+                self._buffer.append(chunk)
+        self.process.stdout.close()
+
+    def output(self) -> str:
+        with self._lock:
+            return "".join(self._buffer)
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        try:
+            return self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def kill(self) -> int | None:
+        if self.process.poll() is None:
+            self.process.kill()
+        return self.wait(timeout=5)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        if self.process.poll() is None:
+            self.process.kill()
+            self.wait(timeout=5)
+        self._reader.join(timeout=1)
+
+
+class _DownstreamCallbackLayer:
+    def __init__(
+        self,
+        *,
+        agent: DownstreamAgentConfig,
+        request_error: type[Exception],
+        store: SQLiteSessionStore | None,
+        upstream_client_getter: Callable[[], Any | None] | None = None,
+        upstream_capabilities_getter: Callable[[], Any | None] | None = None,
+        headless_policy: Callable[[str, dict[str, Any]], str] | None = None,
+    ) -> None:
+        self.agent = agent
+        self.request_error = request_error
+        self.store = store
+        self._upstream_client_getter = upstream_client_getter or (lambda: None)
+        self._upstream_capabilities_getter = upstream_capabilities_getter or (lambda: None)
+        self._headless_policy = headless_policy or (lambda method, payload: "allow")
+        self._contexts: dict[str, _ExecutionContext] = {}
+        self._terminals: dict[str, _BufferedTerminalProcess] = {}
+        self._terminal_to_session: dict[str, str] = {}
+        self._lock = threading.Lock()
+
+    def bind_execution(self, context: _ExecutionContext) -> None:
+        with self._lock:
+            self._contexts[context.downstream_session_id] = context
+
+    def cleanup_session(self, downstream_session_id: str, *, reason: str) -> None:
+        with self._lock:
+            context = self._contexts.pop(downstream_session_id, None)
+            terminal_ids = [
+                terminal_id
+                for terminal_id, current_session_id in self._terminal_to_session.items()
+                if current_session_id == downstream_session_id
+            ]
+        if context is None:
+            return
+        for terminal_id in terminal_ids:
+            self._release_terminal(context, terminal_id=terminal_id, reason=reason, allow_missing=True)
+
+    async def request_permission(self, **kwargs: Any) -> Any:
+        context = self._require_context(kwargs)
+        if not self.agent.capabilities.supports_permissions:
+            raise self._request_error(
+                "session/request_permission",
+                "Permission brokering is not enabled for this downstream agent",
+                kind="forbidden",
+            )
+        request_id = str(kwargs.get("request_id") or kwargs.get("requestId") or uuid.uuid4().hex)
+        payload = _to_plain_data(kwargs)
+        request_state = PermissionRequestState(
+            request_id=request_id,
+            owner_task_id=context.task.task_id,
+            status="requested",
+            payload=payload,
+            metadata={"agent_id": self.agent.agent_id, "decision_source": "pending"},
+        )
+        self._persist_permission(context, request_state)
+        upstream_client = self._upstream_client_getter()
+        if upstream_client is not None and hasattr(upstream_client, "request_permission"):
+            response = await upstream_client.request_permission(**kwargs)
+            decision = self._extract_permission_decision(response)
+            request_state.status = "decided"
+            request_state.decision = decision
+            request_state.metadata["decision_source"] = "upstream"
+            request_state.metadata["audit"] = {
+                "request": payload,
+                "decision": decision,
+                "response": _to_plain_data(response),
+            }
+            self._persist_permission(context, request_state)
+            return response
+        decision = self._headless_policy("session/request_permission", payload)
+        request_state.status = "decided"
+        request_state.decision = decision
+        request_state.metadata["decision_source"] = "headless_policy"
+        request_state.metadata["audit"] = {
+            "request": payload,
+            "decision": decision,
+        }
+        self._persist_permission(context, request_state)
+        return {"request_id": request_id, "decision": decision}
+
+    async def read_text_file(self, **kwargs: Any) -> Any:
+        context = self._require_context(kwargs)
+        if not self.agent.capabilities.supports_filesystem:
+            raise self._request_error("fs/read_text_file", "Filesystem access is not enabled for this downstream agent", kind="forbidden")
+        requested_path = self._extract_path(kwargs)
+        resolved_path = self._validate_filesystem_access(
+            context=context,
+            method="fs/read_text_file",
+            path=requested_path,
+            upstream_method_name="read_text_file",
+        )
+        upstream_client = self._upstream_client_getter()
+        self._persist_trace(
+            context,
+            trace_key=f"fs:{uuid.uuid4().hex}",
+            metadata={"method": "fs/read_text_file", "path": str(resolved_path), "decision": "allow"},
+        )
+        if upstream_client is not None and hasattr(upstream_client, "read_text_file"):
+            return await upstream_client.read_text_file(path=str(resolved_path))
+        return {"path": str(resolved_path), "content": Path(resolved_path).read_text(encoding="utf-8")}
+
+    async def write_text_file(self, **kwargs: Any) -> Any:
+        context = self._require_context(kwargs)
+        if not self.agent.capabilities.supports_filesystem:
+            raise self._request_error("fs/write_text_file", "Filesystem access is not enabled for this downstream agent", kind="forbidden")
+        requested_path = self._extract_path(kwargs)
+        resolved_path = self._validate_filesystem_access(
+            context=context,
+            method="fs/write_text_file",
+            path=requested_path,
+            upstream_method_name="write_text_file",
+        )
+        content = kwargs.get("content")
+        if not isinstance(content, str):
+            raise self._request_error("fs/write_text_file", "Expected string 'content' payload", kind="invalid_params")
+        upstream_client = self._upstream_client_getter()
+        self._persist_trace(
+            context,
+            trace_key=f"fs:{uuid.uuid4().hex}",
+            metadata={"method": "fs/write_text_file", "path": str(resolved_path), "decision": "allow"},
+        )
+        if upstream_client is not None and hasattr(upstream_client, "write_text_file"):
+            return await upstream_client.write_text_file(path=str(resolved_path), content=content)
+        Path(resolved_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(resolved_path).write_text(content, encoding="utf-8")
+        return {"path": str(resolved_path), "bytes_written": len(content.encode("utf-8"))}
+
+    async def create_terminal(self, **kwargs: Any) -> Any:
+        context = self._require_context(kwargs)
+        if not self.agent.capabilities.supports_terminal:
+            raise self._request_error("terminal/create", "Terminal access is not enabled for this downstream agent", kind="forbidden")
+        command = self._normalize_terminal_command(kwargs)
+        terminal_id = str(kwargs.get("terminal_id") or kwargs.get("terminalId") or f"term-{uuid.uuid4().hex[:12]}")
+        env = os.environ.copy()
+        upstream_client = self._upstream_client_getter()
+        if upstream_client is not None and hasattr(upstream_client, "create_terminal"):
+            response = await upstream_client.create_terminal(command=command, cwd=context.cwd)
+            upstream_terminal_id = str(
+                _to_plain_data(response).get("terminal_id")
+                or _to_plain_data(response).get("terminalId")
+                or terminal_id
+            )
+        else:
+            process = await asyncio.to_thread(
+                _BufferedTerminalProcess,
+                terminal_id,
+                command,
+                cwd=context.cwd,
+                env=env,
+            )
+            with self._lock:
+                self._terminals[terminal_id] = process
+                self._terminal_to_session[terminal_id] = context.downstream_session_id
+            upstream_terminal_id = terminal_id
+        self._persist_terminal(
+            context,
+            TerminalMapping(
+                upstream_terminal_id=upstream_terminal_id,
+                downstream_terminal_id=terminal_id,
+                owner_task_id=context.task.task_id,
+                owner_agent_id=self.agent.agent_id,
+                refcount=1,
+                status="active",
+                metadata={"command": command},
+            ),
+        )
+        return {"terminal_id": terminal_id}
+
+    async def terminal_output(self, **kwargs: Any) -> Any:
+        context = self._require_context(kwargs)
+        terminal_id = self._extract_terminal_id(kwargs)
+        mapping = self._require_terminal_mapping(context, terminal_id, method="terminal/output")
+        upstream_client = self._upstream_client_getter()
+        if upstream_client is not None and hasattr(upstream_client, "terminal_output"):
+            return await upstream_client.terminal_output(terminal_id=mapping.upstream_terminal_id)
+        process = self._require_local_terminal(terminal_id, method="terminal/output")
+        return {"terminal_id": terminal_id, "content": process.output()}
+
+    async def wait_for_terminal_exit(self, **kwargs: Any) -> Any:
+        context = self._require_context(kwargs)
+        terminal_id = self._extract_terminal_id(kwargs)
+        mapping = self._require_terminal_mapping(context, terminal_id, method="terminal/wait_for_exit")
+        timeout = kwargs.get("timeout_seconds") or kwargs.get("timeoutSeconds")
+        timeout_value = float(timeout) if isinstance(timeout, (int, float)) else None
+        upstream_client = self._upstream_client_getter()
+        if upstream_client is not None and hasattr(upstream_client, "wait_for_terminal_exit"):
+            response = await upstream_client.wait_for_terminal_exit(
+                terminal_id=mapping.upstream_terminal_id,
+                timeout_seconds=timeout_value,
+            )
+            self._mark_terminal_status(context, mapping, status="exited")
+            return response
+        process = self._require_local_terminal(terminal_id, method="terminal/wait_for_exit")
+        exit_code = await asyncio.to_thread(process.wait, timeout_value)
+        if exit_code is None:
+            return {"terminal_id": terminal_id, "status": "running"}
+        self._mark_terminal_status(context, mapping, status="exited")
+        return {"terminal_id": terminal_id, "exit_code": exit_code, "status": "exited"}
+
+    async def kill_terminal(self, **kwargs: Any) -> Any:
+        context = self._require_context(kwargs)
+        terminal_id = self._extract_terminal_id(kwargs)
+        mapping = self._require_terminal_mapping(context, terminal_id, method="terminal/kill")
+        if mapping.status in {"released", "completed"}:
+            raise self._request_error("terminal/kill", f"Terminal {terminal_id!r} is not active", kind="forbidden")
+        upstream_client = self._upstream_client_getter()
+        if upstream_client is not None and hasattr(upstream_client, "kill_terminal"):
+            response = await upstream_client.kill_terminal(terminal_id=mapping.upstream_terminal_id)
+        else:
+            process = self._require_local_terminal(terminal_id, method="terminal/kill")
+            exit_code = await asyncio.to_thread(process.kill)
+            response = {"terminal_id": terminal_id, "exit_code": exit_code, "status": "killed"}
+        self._mark_terminal_status(context, mapping, status="killed")
+        return response
+
+    async def release_terminal(self, **kwargs: Any) -> Any:
+        context = self._require_context(kwargs)
+        terminal_id = self._extract_terminal_id(kwargs)
+        self._release_terminal(context, terminal_id=terminal_id, reason="release", allow_missing=False)
+        return {"terminal_id": terminal_id, "status": "released"}
+
+    def _release_terminal(
+        self,
+        context: _ExecutionContext,
+        *,
+        terminal_id: str,
+        reason: str,
+        allow_missing: bool,
+    ) -> None:
+        try:
+            mapping = self._require_terminal_mapping(context, terminal_id, method="terminal/release")
+        except Exception:
+            if allow_missing:
+                return
+            raise
+        process = None
+        with self._lock:
+            process = self._terminals.pop(terminal_id, None)
+            self._terminal_to_session.pop(terminal_id, None)
+        if process is not None:
+            process.release()
+        self._mark_terminal_status(context, mapping, status="released", extra_metadata={"cleanup_reason": reason})
+
+    def _mark_terminal_status(
+        self,
+        context: _ExecutionContext,
+        mapping: TerminalMapping,
+        *,
+        status: str,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> None:
+        mapping.status = status
+        mapping.updated_at = time.time()
+        if extra_metadata:
+            mapping.metadata.update(extra_metadata)
+        self._persist_terminal(context, mapping)
+
+    def _require_local_terminal(self, terminal_id: str, *, method: str) -> _BufferedTerminalProcess:
+        with self._lock:
+            process = self._terminals.get(terminal_id)
+        if process is None:
+            raise self._request_error(method, f"Terminal {terminal_id!r} is not available", kind="forbidden")
+        return process
+
+    def _require_terminal_mapping(
+        self,
+        context: _ExecutionContext,
+        terminal_id: str,
+        *,
+        method: str,
+    ) -> TerminalMapping:
+        if self.store is None:
+            return TerminalMapping(
+                upstream_terminal_id=terminal_id,
+                downstream_terminal_id=terminal_id,
+                owner_task_id=context.task.task_id,
+                owner_agent_id=self.agent.agent_id,
+            )
+        snapshot = self.store.load(context.orchestrator_session_id)
+        if snapshot is None:
+            raise self._request_error(method, "Orchestrator session is unavailable", kind="internal_error")
+        for mapping in snapshot.terminal_mappings:
+            if (
+                mapping.downstream_terminal_id == terminal_id
+                and mapping.owner_task_id == context.task.task_id
+                and mapping.owner_agent_id == self.agent.agent_id
+            ):
+                return mapping
+        raise self._request_error(method, f"Terminal {terminal_id!r} is not mapped to this task", kind="forbidden")
+
+    def _validate_filesystem_access(
+        self,
+        *,
+        context: _ExecutionContext,
+        method: str,
+        path: str,
+        upstream_method_name: str,
+    ) -> Path:
+        raw_path = Path(path)
+        if not raw_path.is_absolute():
+            self._persist_trace(context, trace_key=f"fs:{uuid.uuid4().hex}", metadata={"method": method, "path": path, "decision": "deny", "reason": "path_not_absolute"})
+            raise self._request_error(method, f"Path must be absolute: {path!r}", kind="invalid_params")
+        resolved = raw_path.resolve()
+        cwd = Path(context.cwd).resolve()
+        try:
+            resolved.relative_to(cwd)
+        except ValueError as exc:
+            self._persist_trace(context, trace_key=f"fs:{uuid.uuid4().hex}", metadata={"method": method, "path": str(resolved), "decision": "deny", "reason": "path_out_of_scope"})
+            raise self._request_error(method, f"Path {resolved} is outside session cwd {cwd}", kind="permission_denied") from exc
+        upstream_client = self._upstream_client_getter()
+        if upstream_client is not None and not hasattr(upstream_client, upstream_method_name):
+            self._persist_trace(context, trace_key=f"fs:{uuid.uuid4().hex}", metadata={"method": method, "path": str(resolved), "decision": "deny", "reason": "upstream_capability_gated"})
+            raise self._request_error(method, f"Upstream client does not permit {method}", kind="forbidden")
+        upstream_capabilities = _to_plain_data(self._upstream_capabilities_getter())
+        if upstream_client is not None and isinstance(upstream_capabilities, dict):
+            filesystem_capability = upstream_capabilities.get("filesystem") or upstream_capabilities.get("fs")
+            if filesystem_capability is False:
+                self._persist_trace(context, trace_key=f"fs:{uuid.uuid4().hex}", metadata={"method": method, "path": str(resolved), "decision": "deny", "reason": "upstream_capability_disabled"})
+                raise self._request_error(method, f"Upstream capability gating denied {method}", kind="forbidden")
+        return resolved
+
+    def _normalize_terminal_command(self, payload: dict[str, Any]) -> list[str]:
+        command = payload.get("command")
+        if isinstance(command, str) and command:
+            return ["/bin/sh", "-lc", command]
+        if isinstance(command, list) and all(isinstance(item, str) and item for item in command):
+            return list(command)
+        raise self._request_error("terminal/create", "Expected non-empty 'command' string or string list", kind="invalid_params")
+
+    def _extract_path(self, payload: dict[str, Any]) -> str:
+        path = payload.get("path")
+        if isinstance(path, str) and path:
+            return path
+        raise self._request_error("fs/path", "Expected non-empty 'path' string", kind="invalid_params")
+
+    def _extract_terminal_id(self, payload: dict[str, Any]) -> str:
+        terminal_id = payload.get("terminal_id") or payload.get("terminalId")
+        if isinstance(terminal_id, str) and terminal_id:
+            return terminal_id
+        raise self._request_error("terminal/id", "Expected non-empty 'terminal_id' string", kind="invalid_params")
+
+    def _extract_permission_decision(self, response: Any) -> str:
+        payload = _to_plain_data(response)
+        if isinstance(payload, dict):
+            decision = payload.get("decision") or payload.get("result")
+            if isinstance(decision, str) and decision:
+                return decision
+        return "allow"
+
+    def _persist_permission(self, context: _ExecutionContext, request: PermissionRequestState) -> None:
+        if self.store is None:
+            return
+        self.store.persist_permission_event(context.orchestrator_session_id, request)
+
+    def _persist_terminal(self, context: _ExecutionContext, mapping: TerminalMapping) -> None:
+        if self.store is None:
+            return
+        self.store.persist_terminal_event(context.orchestrator_session_id, mapping)
+
+    def _persist_trace(self, context: _ExecutionContext, *, trace_key: str, metadata: dict[str, Any]) -> None:
+        if self.store is None:
+            return
+        self.store.persist_trace_metadata(
+            context.orchestrator_session_id,
+            TraceCorrelationState(
+                trace_key=trace_key,
+                task_id=context.task.task_id,
+                metadata={
+                    "agent_id": self.agent.agent_id,
+                    **metadata,
+                },
+            ),
+        )
+
+    def _require_context(self, payload: dict[str, Any]) -> _ExecutionContext:
+        session_id = payload.get("session_id") or payload.get("sessionId")
+        if isinstance(session_id, str):
+            with self._lock:
+                context = self._contexts.get(session_id)
+            if context is not None:
+                return context
+        with self._lock:
+            if len(self._contexts) == 1:
+                return next(iter(self._contexts.values()))
+        raise self._request_error("session/context", "Downstream callback invoked without an active execution context", kind="internal_error")
+
+    def _request_error(self, method: str, message: str, *, kind: str) -> Exception:
+        builder = getattr(self.request_error, kind, None)
+        if callable(builder):
+            return builder(method, message)
+        message_with_method = f"{method}: {message}"
+        try:
+            return self.request_error(message_with_method)
+        except Exception:
+            return RuntimeError(message_with_method)
+
+
 class _LoopThread:
     def __init__(self) -> None:
         self._loop = asyncio.new_event_loop()
@@ -102,7 +576,15 @@ class _SessionUpdateCollector:
 
 
 class AcpDownstreamConnector:
-    def __init__(self, agent: DownstreamAgentConfig) -> None:
+    def __init__(
+        self,
+        agent: DownstreamAgentConfig,
+        *,
+        store: SQLiteSessionStore | None = None,
+        upstream_client_getter: Callable[[], Any | None] | None = None,
+        upstream_capabilities_getter: Callable[[], Any | None] | None = None,
+        headless_policy: Callable[[str, dict[str, Any]], str] | None = None,
+    ) -> None:
         self.agent = agent
         self.negotiated_state: DownstreamNegotiatedState | None = None
         self._loop_thread: _LoopThread | None = None
@@ -114,6 +596,11 @@ class AcpDownstreamConnector:
         self._lock = threading.Lock()
         self._catalog_state: dict[str, Any] | None = None
         self._catalog_refresh_required = True
+        self._store = store
+        self._upstream_client_getter = upstream_client_getter or (lambda: None)
+        self._upstream_capabilities_getter = upstream_capabilities_getter or (lambda: None)
+        self._headless_policy = headless_policy
+        self._callback_layer: _DownstreamCallbackLayer | None = None
 
     def discover_catalog(self, *, force: bool = False) -> dict[str, Any]:
         self._ensure_started()
@@ -171,7 +658,15 @@ class AcpDownstreamConnector:
     async def _start_async(self) -> None:
         sdk = _load_sdk()
         self._sdk = sdk
-        client_impl = _build_runtime_client(sdk, self._collector)
+        self._callback_layer = _DownstreamCallbackLayer(
+            agent=self.agent,
+            request_error=sdk.request_error,
+            store=self._store,
+            upstream_client_getter=self._upstream_client_getter,
+            upstream_capabilities_getter=self._upstream_capabilities_getter,
+            headless_policy=self._headless_policy,
+        )
+        client_impl = _build_runtime_client(sdk, self._collector, self._callback_layer)
         self._context_manager = sdk.spawn_agent_process(client_impl, self.agent.command, *self.agent.args)
         try:
             self._conn, self._process = await self._context_manager.__aenter__()
@@ -196,6 +691,9 @@ class AcpDownstreamConnector:
         await self._refresh_catalog_async(force=True)
 
     async def _close_async(self) -> None:
+        if self._callback_layer is not None:
+            for session_id in list(self._callback_layer._contexts.keys()):
+                self._callback_layer.cleanup_session(session_id, reason="connector_close")
         if self._context_manager is not None:
             await self._context_manager.__aexit__(None, None, None)
         self._context_manager = None
@@ -208,7 +706,11 @@ class AcpDownstreamConnector:
     async def _cancel_async(self, downstream_session_id: str) -> None:
         if self._conn is None:
             return
-        await self._conn.cancel(session_id=downstream_session_id)
+        try:
+            await self._conn.cancel(session_id=downstream_session_id)
+        finally:
+            if self._callback_layer is not None:
+                self._callback_layer.cleanup_session(downstream_session_id, reason="cancel")
 
     async def _discover_catalog_async(self, *, force: bool = False) -> dict[str, Any]:
         if self._conn is None:
@@ -233,6 +735,15 @@ class AcpDownstreamConnector:
         session_id, session_payload = await self._ensure_session_async(cwd, downstream_session_id)
         self._record_session_state(session_id, session_payload)
         await self._apply_model_selection_async(session_id, selected_model, cwd=cwd)
+        if self._callback_layer is not None:
+            self._callback_layer.bind_execution(
+                _ExecutionContext(
+                    orchestrator_session_id=orchestrator_session_id,
+                    downstream_session_id=session_id,
+                    cwd=cwd,
+                    task=task,
+                )
+            )
 
         prompt_text = self._build_prompt(
             orchestrator_session_id=orchestrator_session_id,
@@ -241,22 +752,30 @@ class AcpDownstreamConnector:
             selected_model=selected_model,
         )
         self._collector.reset(session_id)
-        response = await self._conn.prompt(
-            session_id=session_id,
-            prompt=[self._sdk.text_block(prompt_text)],
-        )
-        updates = self._collector.get(session_id)
-        summary = _extract_summary(_to_plain_data(response), updates)
-        if not summary:
-            summary = f"Downstream agent {self.agent.name} completed {task.title!r}."
-        return DownstreamPromptResult(
-            downstream_session_id=session_id,
-            status=TaskStatus.COMPLETED,
-            summary=summary,
-            raw_output=summary,
-            updates=updates,
-            response=_to_plain_data(response),
-        )
+        cleanup_reason = "completion"
+        try:
+            response = await self._conn.prompt(
+                session_id=session_id,
+                prompt=[self._sdk.text_block(prompt_text)],
+            )
+            updates = self._collector.get(session_id)
+            summary = _extract_summary(_to_plain_data(response), updates)
+            if not summary:
+                summary = f"Downstream agent {self.agent.name} completed {task.title!r}."
+            return DownstreamPromptResult(
+                downstream_session_id=session_id,
+                status=TaskStatus.COMPLETED,
+                summary=summary,
+                raw_output=summary,
+                updates=updates,
+                response=_to_plain_data(response),
+            )
+        except Exception:
+            cleanup_reason = "failure"
+            raise
+        finally:
+            if self._callback_layer is not None:
+                self._callback_layer.cleanup_session(session_id, reason=cleanup_reason)
 
     async def _ensure_session_async(self, cwd: str, downstream_session_id: str | None) -> tuple[str, Any]:
         if downstream_session_id and self.negotiated_state and self.negotiated_state.load_session_supported:
@@ -393,33 +912,37 @@ def _load_sdk() -> _SdkBindings:
         raise DownstreamConnectorError(f"Installed ACP SDK is missing required API surface: {exc}") from exc
 
 
-def _build_runtime_client(sdk: _SdkBindings, collector: _SessionUpdateCollector) -> Any:
+def _build_runtime_client(
+    sdk: _SdkBindings,
+    collector: _SessionUpdateCollector,
+    callback_layer: _DownstreamCallbackLayer,
+) -> Any:
     request_error = sdk.request_error
 
     class RuntimeClient(sdk.client_base):
         async def request_permission(self, **kwargs: Any) -> Any:
-            raise request_error.method_not_found("session/request_permission")
+            return await callback_layer.request_permission(**kwargs)
 
         async def write_text_file(self, **kwargs: Any) -> Any:
-            raise request_error.method_not_found("fs/write_text_file")
+            return await callback_layer.write_text_file(**kwargs)
 
         async def read_text_file(self, **kwargs: Any) -> Any:
-            raise request_error.method_not_found("fs/read_text_file")
+            return await callback_layer.read_text_file(**kwargs)
 
         async def create_terminal(self, **kwargs: Any) -> Any:
-            raise request_error.method_not_found("terminal/create")
+            return await callback_layer.create_terminal(**kwargs)
 
         async def terminal_output(self, **kwargs: Any) -> Any:
-            raise request_error.method_not_found("terminal/output")
+            return await callback_layer.terminal_output(**kwargs)
 
         async def release_terminal(self, **kwargs: Any) -> Any:
-            raise request_error.method_not_found("terminal/release")
+            return await callback_layer.release_terminal(**kwargs)
 
         async def wait_for_terminal_exit(self, **kwargs: Any) -> Any:
-            raise request_error.method_not_found("terminal/wait_for_exit")
+            return await callback_layer.wait_for_terminal_exit(**kwargs)
 
         async def kill_terminal(self, **kwargs: Any) -> Any:
-            raise request_error.method_not_found("terminal/kill")
+            return await callback_layer.kill_terminal(**kwargs)
 
         async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
             collector.append(session_id, update)
