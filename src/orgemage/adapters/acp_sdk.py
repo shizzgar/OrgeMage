@@ -27,6 +27,21 @@ def _acp_attr(acp: Any, name: str) -> Any:
     return None
 
 
+def _extract_mcp_servers(kwargs: dict[str, Any]) -> list[dict[str, Any]]:
+    candidate = kwargs.get("mcp_servers")
+    if candidate is None:
+        candidate = kwargs.get("mcpServers")
+    if not isinstance(candidate, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for index, server in enumerate(candidate):
+        if isinstance(server, dict):
+            normalized.append({str(key): value for key, value in server.items()})
+        else:
+            normalized.append({"id": f"mcp-{index}", "value": server})
+    return normalized
+
+
 class AcpSdkBridge:
     """Lazy ACP SDK bridge.
 
@@ -81,14 +96,22 @@ class AcpAgentRuntime:
         return _build_initialize_response(self.acp, protocol_version)
 
     async def new_session(self, cwd: str, **kwargs: Any) -> Any:
-        session = self.orchestrator.create_session(cwd, kwargs.get("model"))
+        session = self.orchestrator.create_session(
+            cwd,
+            kwargs.get("model"),
+            mcp_servers=_extract_mcp_servers(kwargs),
+        )
         response = _build_new_session_response(self.acp, session.session_id, self.orchestrator)
         self._schedule_session_info_update(session.session_id)
         return response
 
     async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> Any:
         del cwd
-        snapshot = self.orchestrator.load_session(session_id, selected_model=kwargs.get("model"))
+        snapshot = self.orchestrator.load_session(
+            session_id,
+            selected_model=kwargs.get("model"),
+            mcp_servers=_extract_mcp_servers(kwargs),
+        )
         response = _build_load_session_response(self.acp, snapshot.session_id, self.orchestrator)
         self._schedule_session_info_update(snapshot.session_id)
         return response
@@ -316,7 +339,7 @@ def _build_load_session_response(acp: Any, session_id: str, orchestrator: Orches
 
 
 def _model_config_options(acp: Any, orchestrator: Orchestrator, *, session_id: str | None = None) -> list[Any]:
-    options = orchestrator.list_model_options()
+    options = orchestrator.list_model_options(refresh=False)
     current_value = _current_model_value(orchestrator, session_id=session_id, options=options)
     if hasattr(acp, "ConfigOption"):
         return [
@@ -364,7 +387,7 @@ def _model_state(acp: Any, orchestrator: Orchestrator, *, session_id: str | None
     model_info = _acp_attr(acp, "ModelInfo")
     if session_model_state is None or model_info is None:
         return None
-    options = orchestrator.list_model_options()
+    options = orchestrator.list_model_options(refresh=False)
     current_value = _current_model_value(orchestrator, session_id=session_id, options=options)
     return session_model_state(
         currentModelId=current_value,

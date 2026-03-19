@@ -5,6 +5,7 @@ from collections import defaultdict
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 import importlib
+import inspect
 import os
 from pathlib import Path
 import subprocess
@@ -68,6 +69,7 @@ class DownstreamConnector(Protocol):
         orchestrator_session_id: str,
         downstream_session_id: str | None,
         cwd: str,
+        mcp_servers: list[dict[str, Any]] | list[Any] | None,
         task: PlanTask,
         coordinator_prompt: str,
         selected_model: str,
@@ -713,6 +715,7 @@ class AcpDownstreamConnector:
         orchestrator_session_id: str,
         downstream_session_id: str | None,
         cwd: str,
+        mcp_servers: list[dict[str, Any]] | list[Any] | None,
         task: PlanTask,
         coordinator_prompt: str,
         selected_model: str,
@@ -724,6 +727,7 @@ class AcpDownstreamConnector:
                 orchestrator_session_id=orchestrator_session_id,
                 downstream_session_id=downstream_session_id,
                 cwd=cwd,
+                mcp_servers=mcp_servers,
                 task=task,
                 coordinator_prompt=coordinator_prompt,
                 selected_model=selected_model,
@@ -827,6 +831,7 @@ class AcpDownstreamConnector:
         orchestrator_session_id: str,
         downstream_session_id: str | None,
         cwd: str,
+        mcp_servers: list[dict[str, Any]] | list[Any] | None,
         task: PlanTask,
         coordinator_prompt: str,
         selected_model: str,
@@ -835,9 +840,18 @@ class AcpDownstreamConnector:
             raise DownstreamConnectorError(f"Downstream agent '{self.agent.agent_id}' is not connected")
 
         debug_event(_LOG, "connector.lifecycle.execute.start", agent_id=self.agent.agent_id, orchestrator_session_id=orchestrator_session_id, task_id=task.task_id, downstream_session_id=downstream_session_id)
-        session_id, session_payload = await self._ensure_session_async(cwd, downstream_session_id)
+        session_id, session_payload = await self._ensure_session_async(
+            cwd,
+            downstream_session_id,
+            mcp_servers=mcp_servers,
+        )
         self._record_session_state(session_id, session_payload)
-        await self._apply_model_selection_async(session_id, selected_model, cwd=cwd)
+        await self._apply_model_selection_async(
+            session_id,
+            selected_model,
+            cwd=cwd,
+            mcp_servers=mcp_servers,
+        )
         if self._callback_layer is not None:
             self._callback_layer.bind_execution(
                 _ExecutionContext(
@@ -885,16 +899,24 @@ class AcpDownstreamConnector:
             if self._callback_layer is not None:
                 self._callback_layer.cleanup_session(session_id, reason=cleanup_reason)
 
-    async def _ensure_session_async(self, cwd: str, downstream_session_id: str | None) -> tuple[str, Any]:
+    async def _ensure_session_async(
+        self,
+        cwd: str,
+        downstream_session_id: str | None,
+        *,
+        mcp_servers: list[dict[str, Any]] | list[Any] | None,
+    ) -> tuple[str, Any]:
+        normalized_mcp_servers = _normalize_mcp_servers(mcp_servers)
+        self._record_mcp_diagnostic(normalized_mcp_servers)
         if downstream_session_id and self.negotiated_state and self.negotiated_state.load_session_supported:
             loaded = await self._conn.load_session(
                 cwd=cwd,
-                mcp_servers=[],
+                mcp_servers=normalized_mcp_servers,
                 session_id=downstream_session_id,
             )
             if loaded is not None:
                 return downstream_session_id, loaded
-        created = await self._conn.new_session(cwd=cwd, mcp_servers=[])
+        created = await self._conn.new_session(cwd=cwd, mcp_servers=normalized_mcp_servers)
         payload = _to_plain_data(created)
         created_session_id = payload.get("session_id") or payload.get("sessionId")
         if not created_session_id:
@@ -903,7 +925,14 @@ class AcpDownstreamConnector:
             )
         return str(created_session_id), created
 
-    async def _apply_model_selection_async(self, session_id: str, selected_model: str, *, cwd: str) -> None:
+    async def _apply_model_selection_async(
+        self,
+        session_id: str,
+        selected_model: str,
+        *,
+        cwd: str,
+        mcp_servers: list[dict[str, Any]] | list[Any] | None,
+    ) -> None:
         if self._conn is None:
             return
         raw_model = self.agent.resolve_model(selected_model) or self.agent.default_model
@@ -914,8 +943,35 @@ class AcpDownstreamConnector:
             config_options = self.negotiated_state.config_options.get(session_id, [])
         if not any(option.get("id") == "model" for option in config_options):
             return
-        await self._conn.set_config_option(session_id=session_id, option_id="model", value=raw_model)
-        await self._refresh_catalog_async(force=True, cwd=cwd, downstream_session_id=session_id)
+        await self._set_config_option_async(session_id=session_id, option_id="model", value=raw_model)
+        await self._refresh_catalog_async(
+            force=True,
+            cwd=cwd,
+            downstream_session_id=session_id,
+            mcp_servers=mcp_servers,
+        )
+
+    async def _set_config_option_async(self, *, session_id: str, option_id: str, value: str) -> Any:
+        if self._conn is None:
+            return None
+        setter = getattr(self._conn, "set_config_option", None)
+        if setter is None:
+            return None
+        try:
+            parameters = inspect.signature(setter).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "config_id" in parameters:
+            return await setter(config_id=option_id, session_id=session_id, value=value)
+        if "option_id" in parameters:
+            return await setter(session_id=session_id, option_id=option_id, value=value)
+        try:
+            return await setter(config_id=option_id, session_id=session_id, value=value)
+        except TypeError:
+            try:
+                return await setter(session_id=session_id, option_id=option_id, value=value)
+            except TypeError:
+                return await setter(option_id, session_id, value)
 
     def _record_session_state(self, session_id: str, session_payload: Any) -> None:
         if self.negotiated_state is None:
@@ -939,22 +995,25 @@ class AcpDownstreamConnector:
         force: bool = False,
         cwd: str | None = None,
         downstream_session_id: str | None = None,
+        mcp_servers: list[dict[str, Any]] | list[Any] | None = None,
     ) -> dict[str, Any]:
         if self._conn is None:
             raise DownstreamConnectorError(f"Downstream agent '{self.agent.agent_id}' is not connected")
         if not force and self._catalog_state is not None and not self._catalog_refresh_required:
             return dict(self._catalog_state)
         normalized_cwd = cwd or "."
+        normalized_mcp_servers = _normalize_mcp_servers(mcp_servers)
+        self._record_mcp_diagnostic(normalized_mcp_servers)
         if downstream_session_id and self.negotiated_state and self.negotiated_state.load_session_supported:
             session_payload = await self._conn.load_session(
                 cwd=normalized_cwd,
-                mcp_servers=[],
+                mcp_servers=normalized_mcp_servers,
                 session_id=downstream_session_id,
             )
             if session_payload is None:
-                session_payload = await self._conn.new_session(cwd=normalized_cwd, mcp_servers=[])
+                session_payload = await self._conn.new_session(cwd=normalized_cwd, mcp_servers=normalized_mcp_servers)
         else:
-            session_payload = await self._conn.new_session(cwd=normalized_cwd, mcp_servers=[])
+            session_payload = await self._conn.new_session(cwd=normalized_cwd, mcp_servers=normalized_mcp_servers)
         payload = _to_plain_data(session_payload)
         session_id = str(payload.get("session_id") or payload.get("sessionId") or downstream_session_id or "")
         if session_id:
@@ -976,6 +1035,22 @@ class AcpDownstreamConnector:
         }
         self._catalog_refresh_required = False
         return dict(self._catalog_state)
+
+    def _record_mcp_diagnostic(self, mcp_servers: list[dict[str, Any]]) -> None:
+        if self.negotiated_state is None or not mcp_servers:
+            return
+        capabilities = self.negotiated_state.agent_capabilities
+        supports_mcp = capabilities.get("supportsMcp")
+        if supports_mcp is None:
+            supports_mcp = capabilities.get("supports_mcp")
+        if supports_mcp is None:
+            supports_mcp = capabilities.get("mcp")
+        if supports_mcp is False:
+            self.negotiated_state.add_diagnostic(
+                kind="mcp_capability_mismatch",
+                message=f"Downstream agent '{self.agent.agent_id}' received MCP servers but advertised no MCP support.",
+                metadata={"mcp_servers": list(mcp_servers)},
+            )
 
     def _build_prompt(
         self,
@@ -1134,6 +1209,19 @@ def _to_plain_data(value: Any) -> Any:
     if hasattr(value, "__dict__"):
         return {key: _to_plain_data(item) for key, item in vars(value).items() if not key.startswith("_")}
     return str(value)
+
+
+def _normalize_mcp_servers(value: list[dict[str, Any]] | list[Any] | Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        plain_item = _to_plain_data(item)
+        if isinstance(plain_item, dict):
+            normalized.append({str(key): item_value for key, item_value in plain_item.items()})
+        else:
+            normalized.append({"id": f"mcp-{index}", "value": plain_item})
+    return normalized
 
 
 def _extract_command_advertisements(capabilities: dict[str, Any]) -> list[str]:

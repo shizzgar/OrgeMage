@@ -91,6 +91,7 @@ class DownstreamNegotiatedState:
     protocol_version: int | None = None
     session_capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
     config_options: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def load_session_supported(self) -> bool:
@@ -115,7 +116,19 @@ class DownstreamNegotiatedState:
             "protocol_version": self.protocol_version,
             "session_capabilities": self.session_capabilities,
             "config_options": self.config_options,
+            "diagnostics": self.diagnostics,
         }
+
+    def add_diagnostic(self, *, kind: str, message: str, metadata: dict[str, Any] | None = None) -> None:
+        entry = {
+            "kind": kind,
+            "message": message,
+        }
+        if metadata:
+            entry["metadata"] = dict(metadata)
+        if entry in self.diagnostics:
+            return
+        self.diagnostics.append(entry)
 
 
 @dataclass(slots=True)
@@ -341,12 +354,22 @@ class SessionSnapshot:
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
+    mcp_servers: list[dict[str, Any]] = field(default_factory=list)
     downstream_session_mappings: list[DownstreamSessionMapping] = field(default_factory=list)
     turns: list[OrchestrationTurnState] = field(default_factory=list)
     task_states: list[TaskExecutionState] = field(default_factory=list)
     terminal_mappings: list[TerminalMapping] = field(default_factory=list)
     permission_requests: list[PermissionRequestState] = field(default_factory=list)
     trace_metadata: list[TraceCorrelationState] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.mcp_servers:
+            self.set_mcp_servers(self.mcp_servers)
+            return
+        legacy = self.metadata.get("mcp_servers", self.metadata.get("mcpServers", []))
+        self.mcp_servers = _normalize_mcp_servers(legacy)
+        self.metadata["mcp_servers"] = list(self.mcp_servers)
+        self.metadata.pop("mcpServers", None)
 
     @property
     def task_graph(self) -> list[dict[str, Any]]:
@@ -449,6 +472,12 @@ class SessionSnapshot:
                 return turn
         return None
 
+    def set_mcp_servers(self, mcp_servers: list[dict[str, Any]] | list[Any] | None) -> None:
+        normalized = _normalize_mcp_servers(mcp_servers)
+        self.mcp_servers = normalized
+        self.metadata["mcp_servers"] = list(normalized)
+        self.metadata.pop("mcpServers", None)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
@@ -459,6 +488,7 @@ class SessionSnapshot:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "metadata": dict(self.metadata),
+            "mcp_servers": list(self.mcp_servers),
             "downstream_session_mappings": [mapping.to_dict() for mapping in self.downstream_session_mappings],
             "turns": [turn.to_dict() for turn in self.turns],
             "task_states": [task.to_dict() for task in self.task_states],
@@ -467,6 +497,18 @@ class SessionSnapshot:
             "permission_requests": [request.to_dict() for request in self.permission_requests],
             "trace_metadata": [trace.to_dict() for trace in self.trace_metadata],
         }
+
+
+def _normalize_mcp_servers(value: list[dict[str, Any]] | list[Any] | Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if isinstance(item, dict):
+            normalized.append({str(key): item_value for key, item_value in item.items()})
+        else:
+            normalized.append({"id": f"mcp-{index}", "value": item})
+    return normalized
 
 
 @dataclass(slots=True)

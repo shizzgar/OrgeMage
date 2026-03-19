@@ -58,10 +58,12 @@ class _MockConnectorAdapter:
         orchestrator_session_id: str,
         downstream_session_id: str | None,
         cwd: str,
+        mcp_servers: list[dict[str, object]] | list[object] | None,
         task: PlanTask,
         coordinator_prompt: str,
         selected_model: str,
     ) -> DownstreamPromptResult:
+        del mcp_servers
         result = self._client.execute_task(
             session_id=orchestrator_session_id,
             task=task,
@@ -150,6 +152,7 @@ class DownstreamConnectorManager:
             orchestrator_session_id=session.session_id,
             downstream_session_id=downstream_session_id,
             cwd=session.cwd,
+            mcp_servers=session.mcp_servers,
             task=task,
             coordinator_prompt=coordinator_prompt,
             selected_model=selected_model,
