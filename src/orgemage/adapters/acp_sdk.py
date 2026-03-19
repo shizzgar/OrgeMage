@@ -130,6 +130,7 @@ class AcpAgentRuntime:
         del kwargs
         if option_id == "model":
             self.orchestrator.set_selected_model(session_id, value)
+            await self._send_config_option_update(session_id)
             await self._send_session_info_update(session_id)
         response_type = _acp_attr(self.acp, "SetSessionConfigOptionResponse")
         if response_type is not None:
@@ -139,9 +140,21 @@ class AcpAgentRuntime:
     async def set_session_model(self, session_id: str, model_id: str, **kwargs: Any) -> Any:
         del kwargs
         self.orchestrator.set_selected_model(session_id, model_id)
+        await self._send_config_option_update(session_id)
         await self._send_session_info_update(session_id)
         response_type = _acp_attr(self.acp, "SetSessionModelResponse")
         return response_type() if response_type is not None else None
+
+    async def set_session_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> Any:
+        del kwargs
+        self.orchestrator.set_session_mode(session_id, mode_id)
+        await self._send_current_mode_update(session_id)
+        await self._send_session_info_update(session_id)
+        response_type = _acp_attr(self.acp, "SetSessionModeResponse")
+        return response_type() if response_type is not None else None
+
+    async def set_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> Any:
+        return await self.set_session_mode(session_id, mode_id, **kwargs)
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> Any:
         prompt_metadata = extract_prompt_metadata(prompt, **kwargs)
@@ -209,6 +222,26 @@ class AcpAgentRuntime:
             },
         )
 
+    async def _send_current_mode_update(self, session_id: str) -> None:
+        await self._send_session_update(
+            session_id,
+            {
+                "sessionUpdate": "current_mode",
+                "session_id": session_id,
+                "modes": _mode_state(self.acp, self.orchestrator, session_id=session_id),
+            },
+        )
+
+    async def _send_config_option_update(self, session_id: str) -> None:
+        await self._send_session_update(
+            session_id,
+            {
+                "sessionUpdate": "config_options",
+                "session_id": session_id,
+                "config_options": _model_config_options(self.acp, self.orchestrator, session_id=session_id),
+            },
+        )
+
     def _schedule_session_info_update(self, session_id: str) -> None:
         if self.client_connection is None:
             return
@@ -273,6 +306,12 @@ def _build_agent(acp: Any, runtime: AcpAgentRuntime) -> Any:
         async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> Any:
             return await self.runtime.set_session_model(session_id, model_id, **kwargs)
 
+        async def set_session_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> Any:
+            return await self.runtime.set_session_mode(session_id, mode_id, **kwargs)
+
+        async def set_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> Any:
+            return await self.runtime.set_mode(session_id, mode_id, **kwargs)
+
         async def prompt(self, prompt: list[Any], session_id: str, **kwargs: Any) -> Any:
             return await self.runtime.prompt(session_id, prompt, **kwargs)
 
@@ -319,9 +358,15 @@ def _build_new_session_response(acp: Any, session_id: str, orchestrator: Orchest
     kwargs = {
         "config_options": _model_config_options(acp, orchestrator, session_id=session_id),
         "models": _model_state(acp, orchestrator, session_id=session_id),
+        "modes": _mode_state(acp, orchestrator, session_id=session_id),
     }
     try:
-        return response_type(sessionId=session_id, configOptions=kwargs["config_options"], models=kwargs["models"])
+        return response_type(
+            sessionId=session_id,
+            configOptions=kwargs["config_options"],
+            models=kwargs["models"],
+            modes=kwargs["modes"],
+        )
     except TypeError:
         return response_type(session_id=session_id, config_options=kwargs["config_options"])
 
@@ -331,9 +376,10 @@ def _build_load_session_response(acp: Any, session_id: str, orchestrator: Orches
     kwargs = {
         "config_options": _model_config_options(acp, orchestrator, session_id=session_id),
         "models": _model_state(acp, orchestrator, session_id=session_id),
+        "modes": _mode_state(acp, orchestrator, session_id=session_id),
     }
     try:
-        return response_type(configOptions=kwargs["config_options"], models=kwargs["models"])
+        return response_type(configOptions=kwargs["config_options"], models=kwargs["models"], modes=kwargs["modes"])
     except TypeError:
         return response_type(session_id=session_id, config_options=kwargs["config_options"])
 
@@ -398,6 +444,26 @@ def _model_state(acp: Any, orchestrator: Orchestrator, *, session_id: str | None
     )
 
 
+def _mode_state(acp: Any, orchestrator: Orchestrator, *, session_id: str | None = None) -> Any:
+    session_mode_state = _acp_attr(acp, "SessionModeState")
+    session_mode = _acp_attr(acp, "SessionMode")
+    if session_mode_state is None or session_mode is None:
+        return None
+    available_modes = orchestrator.available_session_modes()
+    current_mode_id = (
+        orchestrator.current_session_mode(session_id)
+        if session_id is not None
+        else orchestrator.DEFAULT_SESSION_MODE
+    )
+    return session_mode_state(
+        currentModeId=current_mode_id,
+        availableModes=[
+            _session_mode_record(session_mode, mode)
+            for mode in available_modes
+        ],
+    )
+
+
 def _current_model_value(orchestrator: Orchestrator, *, session_id: str | None, options: list[dict[str, Any]]) -> str:
     if session_id is not None:
         selected_model = orchestrator.session_info(session_id).get("selected_model")
@@ -419,6 +485,20 @@ def _model_info_record(model_info: Any, option: dict[str, Any]) -> Any:
             name=option["name"],
             description=option["description"],
         )
+
+
+def _session_mode_record(session_mode: Any, mode: dict[str, Any]) -> Any:
+    validate = getattr(session_mode, "model_validate", None)
+    if callable(validate):
+        return validate(mode)
+    try:
+        return session_mode(
+            id=mode["id"],
+            name=mode["name"],
+            description=mode["description"],
+        )
+    except TypeError:
+        return session_mode(**mode)
 
 
 def _session_info_record(acp: Any, payload: dict[str, Any]) -> Any:
@@ -504,6 +584,8 @@ def _session_update_notifications(acp: Any, update: dict[str, Any], *, session_i
                             "history": info.get("history"),
                             "sessionId": info.get("session_id"),
                             "selectedModel": info.get("selected_model"),
+                            "currentModeId": info.get("current_mode_id"),
+                            "availableModes": info.get("available_modes"),
                             "activeTurnId": info.get("active_turn_id"),
                             "activeTurnStatus": info.get("active_turn_status"),
                             "taskCount": info.get("task_count"),
@@ -511,6 +593,33 @@ def _session_update_notifications(acp: Any, update: dict[str, Any], *, session_i
                             "createdAt": info.get("created_at"),
                             "cwd": info.get("cwd"),
                         },
+                    }
+                )
+            )
+    elif session_update == "current_mode":
+        mode_state = update.get("modes")
+        current_mode_type = _acp_attr(acp, "CurrentModeUpdate")
+        if current_mode_type is not None and mode_state is not None:
+            notifications.append(
+                current_mode_type.model_validate(
+                    {
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": getattr(mode_state, "current_mode_id", None)
+                        or getattr(mode_state, "currentModeId", None),
+                        "_meta": {"sessionId": update.get("session_id")},
+                    }
+                )
+            )
+    elif session_update == "config_options":
+        config_options = update.get("config_options") or []
+        config_type = _acp_attr(acp, "ConfigOptionUpdate")
+        if config_type is not None:
+            notifications.append(
+                config_type.model_validate(
+                    {
+                        "sessionUpdate": "config_option_update",
+                        "configOptions": [_config_option_payload(option) for option in config_options],
+                        "_meta": {"sessionId": update.get("session_id")},
                     }
                 )
             )
@@ -537,3 +646,12 @@ def _timestamp_to_iso(value: Any) -> str | None:
     if isinstance(value, (int, float)):
         return datetime.fromtimestamp(value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     return str(value)
+
+
+def _config_option_payload(option: Any) -> dict[str, Any]:
+    if isinstance(option, dict):
+        return dict(option)
+    payload = dict(getattr(option, "__dict__", {}))
+    if "current_value" in payload and "currentValue" not in payload:
+        payload["currentValue"] = payload.pop("current_value")
+    return payload

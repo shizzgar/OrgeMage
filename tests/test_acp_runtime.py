@@ -123,17 +123,30 @@ class _FakeModernAcp:
             self.available_models = availableModels
             self.extra = kwargs
 
+    class SessionMode:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class SessionModeState:
+        def __init__(self, currentModeId: str, availableModes: list[object], **kwargs) -> None:
+            self.current_mode_id = currentModeId
+            self.available_modes = availableModes
+            self.extra = kwargs
+
     class NewSessionResponse:
-        def __init__(self, sessionId: str, configOptions: list[object] | None = None, models=None, **kwargs) -> None:
+        def __init__(self, sessionId: str, configOptions: list[object] | None = None, models=None, modes=None, **kwargs) -> None:
             self.session_id = sessionId
             self.config_options = configOptions or []
             self.models = models
+            self.modes = modes
             self.extra = kwargs
 
     class LoadSessionResponse:
-        def __init__(self, configOptions: list[object] | None = None, models=None, **kwargs) -> None:
+        def __init__(self, configOptions: list[object] | None = None, models=None, modes=None, **kwargs) -> None:
             self.config_options = configOptions or []
             self.models = models
+            self.modes = modes
             self.extra = kwargs
 
     class SessionInfo:
@@ -146,6 +159,11 @@ class _FakeModernAcp:
             self.sessions = sessions
 
     class SessionInfoUpdate:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class CurrentModeUpdate:
         @classmethod
         def model_validate(cls, payload: dict[str, object]) -> object:
             return SimpleNamespace(**payload)
@@ -173,6 +191,15 @@ class _FakeModernAcp:
     class SetSessionConfigOptionResponse:
         def __init__(self, config_options: list[object]) -> None:
             self.config_options = config_options
+
+    class ConfigOptionUpdate:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class SetSessionModeResponse:
+        def __init__(self) -> None:
+            pass
 
     class SetSessionModelResponse:
         def __init__(self) -> None:
@@ -325,8 +352,10 @@ def test_acp_runtime_supports_session_loading_prompt_updates_and_cancel(tmp_path
         created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex", mcpServers=mcp_servers)
         assert created.session_id.startswith("orch-")
         assert created.config_options[0].id == "model"
+        assert orchestrator.current_session_mode(created.session_id) == "auto"
 
         await runtime.set_config_option(created.session_id, "model", "qwen::qwen3-coder-plus")
+        await runtime.set_mode(created.session_id, "read-only")
         loaded = await runtime.load_session(tmp_path.as_posix(), created.session_id, mcp_servers=mcp_servers)
         assert loaded.session_id == created.session_id
 
@@ -353,6 +382,7 @@ def test_acp_runtime_supports_session_loading_prompt_updates_and_cancel(tmp_path
     assert kinds[-1] == "session_info"
     assert orchestrator.load_session(connection.updates[0][0]).metadata["cancelled"] is True
     assert orchestrator.load_session(connection.updates[0][0]).mcp_servers == [{"name": "filesystem", "transport": {"type": "stdio", "command": "fs-mcp"}}]
+    assert orchestrator.current_session_mode(connection.updates[0][0]) == "read-only"
 
 
 
@@ -588,13 +618,18 @@ def test_acp_runtime_supports_modern_acp_schema_shapes(tmp_path: Path) -> None:
         assert created.session_id.startswith("orch-")
         assert created.config_options[0].currentValue == "codex::gpt-5-codex"
         assert created.models.current_model_id == "codex::gpt-5-codex"
+        assert created.modes.current_mode_id == "auto"
+        assert [mode.id for mode in created.modes.available_modes] == ["read-only", "auto", "full-access"]
 
         await runtime.set_session_model(created.session_id, "qwen::qwen3-coder-plus")
         config_response = await runtime.set_config_option(created.session_id, "model", "codex::gpt-5-codex")
         assert config_response.config_options[0].currentValue == "codex::gpt-5-codex"
+        mode_response = await runtime.set_session_mode(created.session_id, "full-access")
+        assert isinstance(mode_response, _FakeModernAcp.SetSessionModeResponse)
 
         loaded = await runtime.load_session(tmp_path.as_posix(), created.session_id)
         assert loaded.models.current_model_id == "codex::gpt-5-codex"
+        assert loaded.modes.current_mode_id == "full-access"
 
         listed = await runtime.list_sessions()
         assert listed.sessions[0].sessionId == created.session_id
@@ -611,6 +646,32 @@ def test_acp_runtime_supports_modern_acp_schema_shapes(tmp_path: Path) -> None:
 
     kinds = [getattr(update, "sessionUpdate", None) for _, update in connection.updates]
     assert "session_info_update" in kinds
+    assert "config_option_update" in kinds
+    assert "current_mode_update" in kinds
     assert "plan" in kinds
     assert "tool_call" in kinds
     assert "agent_message_chunk" in kinds
+
+
+def test_acp_runtime_mode_round_trip_and_updates(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    runtime = AcpAgentRuntime(acp=_FakeModernAcp, orchestrator=orchestrator)
+    connection = _RecordingConnection()
+
+    async def scenario() -> None:
+        await runtime.initialize(1, conn=connection)
+        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex")
+        assert created.modes.current_mode_id == "auto"
+
+        response = await runtime.set_mode(created.session_id, "read-only")
+        assert isinstance(response, _FakeModernAcp.SetSessionModeResponse)
+
+        loaded = await runtime.load_session(tmp_path.as_posix(), created.session_id)
+        assert loaded.modes.current_mode_id == "read-only"
+
+    asyncio.run(scenario())
+
+    kinds = [getattr(update, "sessionUpdate", None) for _, update in connection.updates]
+    assert "current_mode_update" in kinds
+    current_mode_updates = [update for _, update in connection.updates if getattr(update, "sessionUpdate", None) == "current_mode_update"]
+    assert current_mode_updates[-1].currentModeId == "read-only"
