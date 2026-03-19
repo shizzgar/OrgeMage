@@ -37,6 +37,16 @@ def _extract_mcp_servers(kwargs: dict[str, Any]) -> list[dict[str, Any]]:
     for index, server in enumerate(candidate):
         if isinstance(server, dict):
             normalized.append({str(key): value for key, value in server.items()})
+        elif hasattr(server, "model_dump"):
+            normalized.append(server.model_dump(mode="json", by_alias=True, exclude_none=True))
+        elif hasattr(server, "__dict__"):
+            normalized.append(
+                {
+                    str(key): value
+                    for key, value in vars(server).items()
+                    if not key.startswith("_")
+                }
+            )
         else:
             normalized.append({"id": f"mcp-{index}", "value": server})
     return normalized
@@ -579,7 +589,7 @@ def _session_update_notifications(acp: Any, update: dict[str, Any], *, session_i
                 plan_update_type.model_validate(
                     {
                         "sessionUpdate": "plan",
-                        "entries": update.get("globalPlan") or update.get("plan") or [],
+                        "entries": _plan_entries_payload(update.get("globalPlan") or update.get("plan") or []),
                         "_meta": update.get("_meta"),
                     }
                 )
@@ -595,7 +605,7 @@ def _session_update_notifications(acp: Any, update: dict[str, Any], *, session_i
                 notifications.append(
                     notification_type.model_validate(
                         {
-                            **tool_call,
+                            **_tool_call_payload(tool_call),
                             "sessionUpdate": kind,
                             "_meta": update.get("_meta"),
                         }
@@ -708,6 +718,45 @@ def _timestamp_to_iso(value: Any) -> str | None:
     return str(value)
 
 
+def _plan_entries_payload(entries: list[Any]) -> list[dict[str, Any]]:
+    return [_plan_entry_payload(entry) for entry in entries]
+
+
+def _plan_entry_payload(entry: Any) -> dict[str, Any]:
+    payload = dict(entry) if isinstance(entry, dict) else dict(getattr(entry, "__dict__", {}))
+    return {
+        "content": str(payload.get("details") or payload.get("title") or ""),
+        "priority": _priority_label(payload.get("priority")),
+        "status": _plan_status_label(payload.get("status")),
+        "_meta": {
+            key: value
+            for key, value in payload.items()
+            if key not in {"content", "details", "title", "priority", "status"}
+        },
+    }
+
+
+def _priority_label(value: Any) -> str:
+    if isinstance(value, str) and value in {"high", "medium", "low"}:
+        return value
+    try:
+        priority = int(value)
+    except (TypeError, ValueError):
+        return "medium"
+    if priority >= 80:
+        return "high"
+    if priority <= 30:
+        return "low"
+    return "medium"
+
+
+def _plan_status_label(value: Any) -> str:
+    normalized = str(value or "pending").lower()
+    if normalized in {"pending", "in_progress", "completed"}:
+        return normalized
+    return "pending"
+
+
 def _config_option_payload(option: Any) -> dict[str, Any]:
     if isinstance(option, dict):
         return dict(option)
@@ -715,6 +764,74 @@ def _config_option_payload(option: Any) -> dict[str, Any]:
     if "current_value" in payload and "currentValue" not in payload:
         payload["currentValue"] = payload.pop("current_value")
     return payload
+
+
+def _tool_call_payload(tool_call: dict[str, Any]) -> dict[str, Any]:
+    content = _tool_call_content_payload(tool_call)
+    payload: dict[str, Any] = {
+        "toolCallId": tool_call.get("toolCallId") or tool_call.get("tool_call_id"),
+        "title": tool_call.get("title"),
+        "kind": _tool_call_kind(tool_call.get("kind")),
+        "status": _tool_call_status(tool_call.get("status")),
+        "locations": _tool_call_locations(tool_call.get("locations") or []),
+        "rawInput": tool_call.get("rawInput") or tool_call.get("raw_input"),
+        "rawOutput": tool_call.get("rawOutput") or tool_call.get("raw_output"),
+    }
+    if content:
+        payload["content"] = content
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _tool_call_content_payload(tool_call: dict[str, Any]) -> list[dict[str, Any]]:
+    content_payload: list[dict[str, Any]] = []
+    for block in tool_call.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            content_payload.append(
+                {
+                    "type": "content",
+                    "content": {
+                        "type": "text",
+                        "text": block.get("text", ""),
+                    },
+                }
+            )
+    terminal = tool_call.get("terminal")
+    if isinstance(terminal, dict):
+        terminal_id = terminal.get("terminalId") or terminal.get("terminal_id")
+        if terminal_id:
+            content_payload.append({"type": "terminal", "terminalId": terminal_id})
+    return content_payload
+
+
+def _tool_call_kind(value: Any) -> str:
+    normalized = str(value or "other")
+    if normalized in {"read", "edit", "delete", "move", "search", "execute", "think", "fetch", "switch_mode", "other"}:
+        return normalized
+    return "other"
+
+
+def _tool_call_status(value: Any) -> str:
+    normalized = str(value or "pending").lower()
+    if normalized in {"pending", "in_progress", "completed", "failed"}:
+        return normalized
+    return "pending"
+
+
+def _tool_call_locations(locations: list[Any]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for location in locations:
+        if isinstance(location, dict):
+            path = location.get("path")
+            if not path:
+                continue
+            payload: dict[str, Any] = {"path": str(path)}
+            line = location.get("line")
+            if isinstance(line, int) and line >= 0:
+                payload["line"] = line
+            payloads.append(payload)
+    return payloads
 
 
 def _available_command_payload(command: Any) -> dict[str, Any]:
