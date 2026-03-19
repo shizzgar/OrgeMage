@@ -121,6 +121,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     acp_parser = subparsers.add_parser("acp", help="Create an ACP agent instance")
     acp_parser.add_argument("--check", action="store_true", help="Only verify that ACP SDK support is available")
+    acp_parser.add_argument(
+        "--stdio",
+        action="store_true",
+        help="Run the ACP agent over stdin/stdout so ACP-compatible clients can launch OrgeMage",
+    )
     return parser
 
 
@@ -162,6 +167,13 @@ def main() -> None:
             runtime = bridge.create_runtime()
         except AcpSdkUnavailableError as exc:
             parser.error(str(exc))
+        if args.stdio:
+            import asyncio
+
+            import acp  # type: ignore[import-not-found]
+
+            asyncio.run(acp.run_agent(runtime.agent))
+            return
         _emit({"agent": runtime.agent.__class__.__name__, "runtime": runtime.__class__.__name__, "acp_sdk_available": True})
         return
 
