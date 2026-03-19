@@ -1,7 +1,11 @@
 import asyncio
+import os
 from pathlib import Path
+import sys
 import threading
 from types import SimpleNamespace
+
+import pytest
 
 from orgemage.adapters.acp_sdk import AcpAgentRuntime
 from orgemage.acp.downstream_client import DownstreamPromptResult
@@ -188,6 +192,74 @@ class _RecordingConnection:
         self.updates.append((session_id, update))
 
 
+class _WireLevelBlockingClient:
+    def __init__(self) -> None:
+        self.updates: list[tuple[str, object]] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def on_connect(self, conn) -> None:
+        self.conn = conn
+
+    async def request_permission(self, options, session_id: str, tool_call, **kwargs):
+        del options, session_id, tool_call, kwargs
+        return None
+
+    async def session_update(self, session_id: str, update, **kwargs) -> None:
+        del kwargs
+        self.updates.append((session_id, update))
+        self.started.set()
+        await self.release.wait()
+
+    async def write_text_file(self, content: str, path: str, session_id: str, **kwargs):
+        del content, path, session_id, kwargs
+        return None
+
+    async def read_text_file(self, path: str, session_id: str, limit: int | None = None, line: int | None = None, **kwargs):
+        del path, session_id, limit, line, kwargs
+        raise AssertionError('read_text_file should not be called in session/new handshake test')
+
+    async def create_terminal(self, command: str, session_id: str, args=None, cwd: str | None = None, env=None, output_byte_limit: int | None = None, **kwargs):
+        del command, session_id, args, cwd, env, output_byte_limit, kwargs
+        raise AssertionError('create_terminal should not be called in session/new handshake test')
+
+    async def terminal_output(self, session_id: str, terminal_id: str, **kwargs):
+        del session_id, terminal_id, kwargs
+        raise AssertionError('terminal_output should not be called in session/new handshake test')
+
+    async def release_terminal(self, session_id: str, terminal_id: str, **kwargs):
+        del session_id, terminal_id, kwargs
+        return None
+
+    async def wait_for_terminal_exit(self, session_id: str, terminal_id: str, **kwargs):
+        del session_id, terminal_id, kwargs
+        raise AssertionError('wait_for_terminal_exit should not be called in session/new handshake test')
+
+    async def kill_terminal(self, session_id: str, terminal_id: str, **kwargs):
+        del session_id, terminal_id, kwargs
+        return None
+
+    async def ext_method(self, method: str, params: dict[str, object]) -> dict[str, object]:
+        del method, params
+        return {}
+
+    async def ext_notification(self, method: str, params: dict[str, object]) -> None:
+        del method, params
+        return None
+
+
+class _BlockingSessionUpdateConnection:
+    def __init__(self) -> None:
+        self.updates: list[tuple[str, dict[str, object]]] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def session_update(self, session_id: str, update: dict[str, object]) -> None:
+        self.updates.append((session_id, update))
+        self.started.set()
+        await self.release.wait()
+
+
 def _agents() -> list[DownstreamAgentConfig]:
     return [
         DownstreamAgentConfig(
@@ -279,6 +351,90 @@ def test_acp_runtime_supports_session_loading_prompt_updates_and_cancel(tmp_path
     assert "cancelled" in kinds
     assert kinds[-1] == "session_info"
     assert orchestrator.load_session(connection.updates[0][0]).metadata["cancelled"] is True
+
+
+
+def test_acp_runtime_new_and_load_session_return_before_startup_update_delivery(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    runtime = AcpAgentRuntime(acp=_FakeAcp, orchestrator=orchestrator)
+    connection = _BlockingSessionUpdateConnection()
+
+    async def scenario() -> None:
+        await runtime.initialize(7, client_connection=connection)
+
+        create_task = asyncio.create_task(runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex"))
+        await asyncio.sleep(0)
+        assert create_task.done() is True
+        created = create_task.result()
+        assert created.session_id.startswith("orch-")
+
+        await asyncio.wait_for(connection.started.wait(), timeout=1)
+        assert connection.updates[0][0] == created.session_id
+        assert connection.updates[0][1]["sessionUpdate"] == "session_info"
+
+        loaded_connection = _BlockingSessionUpdateConnection()
+        runtime.bind_client_connection(loaded_connection)
+        load_task = asyncio.create_task(runtime.load_session(tmp_path.as_posix(), created.session_id))
+        await asyncio.sleep(0)
+        assert load_task.done() is True
+        loaded = load_task.result()
+        assert loaded.session_id == created.session_id
+
+        await asyncio.wait_for(loaded_connection.started.wait(), timeout=1)
+        assert loaded_connection.updates[0][0] == created.session_id
+        assert loaded_connection.updates[0][1]["sessionUpdate"] == "session_info"
+
+        connection.release.set()
+        loaded_connection.release.set()
+        await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+def test_acp_stdio_session_new_returns_before_blocked_startup_update(tmp_path: Path) -> None:
+    acp = pytest.importorskip("acp")
+    client = _WireLevelBlockingClient()
+    db_path = tmp_path / "wire-runtime.db"
+    repo_root = Path(__file__).resolve().parents[1]
+    pythonpath_entries = [str(repo_root / "src")]
+    existing_pythonpath = os.environ.get("PYTHONPATH")
+    if existing_pythonpath:
+        pythonpath_entries.append(existing_pythonpath)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(pythonpath_entries)}
+
+    async def scenario() -> None:
+        async with acp.spawn_agent_process(
+            client,
+            sys.executable,
+            "-m",
+            "orgemage.cli",
+            "--db",
+            str(db_path),
+            "acp",
+            "--stdio",
+            cwd=repo_root,
+            env=env,
+        ) as (conn, process):
+            initialize = await conn.initialize(
+                acp.PROTOCOL_VERSION,
+                client_info=acp.schema.Implementation(name="pytest-wire", version="0"),
+            )
+            assert initialize.protocolVersion == acp.PROTOCOL_VERSION
+
+            new_session_task = asyncio.create_task(conn.new_session(cwd=tmp_path.as_posix()))
+            await asyncio.wait_for(client.started.wait(), timeout=5)
+
+            response = await asyncio.wait_for(new_session_task, timeout=5)
+            session_id = getattr(response, "sessionId", getattr(response, "session_id", ""))
+            assert isinstance(session_id, str) and session_id.startswith("orch-")
+
+            assert client.updates
+            assert getattr(client.updates[0][1], "sessionUpdate", None) == "session_info_update"
+
+            client.release.set()
+            await asyncio.sleep(0)
+            assert process.returncode is None
+
+    asyncio.run(scenario())
 
 
 def test_acp_runtime_prompt_returns_cancelled_stop_reason_for_active_turn(tmp_path: Path) -> None:

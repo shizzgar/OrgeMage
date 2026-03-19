@@ -264,6 +264,8 @@ orgemage --db .orgemage/runtime.db acp --stdio
 
 `orgemage acp --stdio` runs a northbound ACP agent on stdin/stdout via the official ACP Python SDK, which makes it suitable for ACP-compatible desktop clients such as ACP UI.
 
+For startup handshakes, OrgeMage intentionally returns `session/new` and `session/load` before sending the initial `session/update`. This is the same compatibility pattern used by `codex-acp` in `src/agent/core.rs`, where post-creation updates are dispatched asynchronously so they do not race the `NewSessionResponse` delivery path.
+
 
 ## Runtime behavior
 
