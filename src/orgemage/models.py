@@ -15,6 +15,15 @@ class TaskStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class TurnStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    CANCELLING = "cancelling"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
 @dataclass(slots=True)
 class ModelOption:
     value: str
@@ -204,14 +213,16 @@ class DownstreamSessionMapping:
 @dataclass(slots=True)
 class OrchestrationTurnState:
     turn_id: str
-    status: str
+    status: TurnStatus
     stop_reason: str | None = None
     started_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["status"] = self.status.value if isinstance(self.status, TurnStatus) else str(self.status)
+        return payload
 
 
 @dataclass(slots=True)
@@ -421,6 +432,22 @@ class SessionSnapshot:
                 return task_state
         self.task_states.append(task_state)
         return task_state
+
+    def get_turn(self, turn_id: str) -> OrchestrationTurnState | None:
+        for turn in self.turns:
+            if turn.turn_id == turn_id:
+                return turn
+        return None
+
+    def active_turn(self) -> OrchestrationTurnState | None:
+        for turn in reversed(self.turns):
+            try:
+                status = turn.status if isinstance(turn.status, TurnStatus) else TurnStatus(str(turn.status))
+            except ValueError:
+                continue
+            if status in {TurnStatus.PENDING, TurnStatus.RUNNING, TurnStatus.CANCELLING}:
+                return turn
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {

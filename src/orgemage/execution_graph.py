@@ -26,6 +26,8 @@ CreateToolEvent = Callable[[PlanTask], ToolEvent]
 CreateFinishedToolEvent = Callable[[PlanTask, TaskStatus, str], ToolEvent]
 PersistTrace = Callable[[str, TraceCorrelationState], None]
 SaveDownstreamMapping = Callable[[str, str, str], None]
+IsCancelRequested = Callable[[], bool]
+CancelActiveWork = Callable[[], None]
 
 
 @dataclass(slots=True)
@@ -55,6 +57,8 @@ class ExecutionGraphRunner:
         create_finished_event: CreateFinishedToolEvent,
         persist_trace: PersistTrace,
         save_downstream_mapping: SaveDownstreamMapping,
+        is_cancel_requested: IsCancelRequested,
+        cancel_active_work: CancelActiveWork,
     ) -> None:
         self.snapshot = snapshot
         self.tasks = tasks
@@ -73,6 +77,8 @@ class ExecutionGraphRunner:
         self.create_finished_event = create_finished_event
         self.persist_trace = persist_trace
         self.save_downstream_mapping = save_downstream_mapping
+        self.is_cancel_requested = is_cancel_requested
+        self.cancel_active_work = cancel_active_work
         self.events: list[ToolEvent] = []
         self._nodes: dict[str, _RuntimeNode] = {}
         self._inflight: dict[asyncio.Task[WorkerResult], PlanTask] = {}
@@ -91,14 +97,21 @@ class ExecutionGraphRunner:
         self._refresh_dependency_states()
         self.emit_plan_update()
         while True:
+            if self.is_cancel_requested():
+                await self._handle_cancellation()
+                break
             launched = await self._launch_ready_tasks()
             if not self._inflight:
                 if not launched:
                     break
                 continue
-            completed, _ = await asyncio.wait(self._inflight.keys(), return_when=asyncio.FIRST_COMPLETED)
+            completed, _ = await asyncio.wait(self._inflight.keys(), timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
+            if not completed:
+                continue
             for future in completed:
                 task = self._inflight.pop(future)
+                if future.cancelled():
+                    continue
                 result = future.result()
                 self._handle_result(task, result)
 
@@ -146,6 +159,8 @@ class ExecutionGraphRunner:
         return launched
 
     def _handle_result(self, task: PlanTask, result: WorkerResult) -> None:
+        if self.is_cancel_requested():
+            return
         task.status = result.status
         task.output = result.summary
         self.persist_task_state(task, None, result, self._dependency_state(task))
@@ -176,6 +191,25 @@ class ExecutionGraphRunner:
         event = self.create_finished_event(task, result.status, result.summary)
         self.events.append(event)
         self.emit_tool_event(task, event)
+
+    async def _handle_cancellation(self) -> None:
+        self._stop_scheduling = True
+        self.cancel_active_work()
+        for future in self._inflight:
+            future.cancel()
+        for task in self.tasks:
+            if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
+                continue
+            task.status = TaskStatus.CANCELLED
+            self.persist_task_state(task, "turn_cancelled", None, self._dependency_state(task))
+            event = self.create_finished_event(task, TaskStatus.CANCELLED, "Task cancelled.")
+            self.events.append(event)
+            self.emit_tool_event(task, event)
+        self._refresh_dependency_states()
+        self.emit_plan_update()
+        if self._inflight:
+            await asyncio.gather(*self._inflight.keys(), return_exceptions=True)
+        self._inflight.clear()
 
     def _refresh_dependency_states(self) -> None:
         for task in self.tasks:

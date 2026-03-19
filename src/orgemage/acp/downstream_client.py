@@ -159,6 +159,8 @@ class _DownstreamCallbackLayer:
         self._contexts: dict[str, _ExecutionContext] = {}
         self._terminals: dict[str, _BufferedTerminalProcess] = {}
         self._terminal_to_session: dict[str, str] = {}
+        self._pending_permissions: dict[str, set[str]] = defaultdict(set)
+        self._cancelled_sessions: set[str] = set()
         self._lock = threading.Lock()
 
     def bind_execution(self, context: _ExecutionContext) -> None:
@@ -178,6 +180,27 @@ class _DownstreamCallbackLayer:
         for terminal_id in terminal_ids:
             self._release_terminal(context, terminal_id=terminal_id, reason=reason, allow_missing=True)
 
+    async def cancel_session(self, downstream_session_id: str, *, reason: str) -> None:
+        with self._lock:
+            self._cancelled_sessions.add(downstream_session_id)
+            context = self._contexts.get(downstream_session_id)
+            pending_permission_ids = list(self._pending_permissions.get(downstream_session_id, set()))
+        if context is None:
+            return
+        for request_id in pending_permission_ids:
+            self._persist_permission(
+                context,
+                PermissionRequestState(
+                    request_id=request_id,
+                    owner_task_id=context.task.task_id,
+                    status="cancelled",
+                    decision="cancelled",
+                    metadata={"agent_id": self.agent.agent_id, "decision_source": "cancel", "cancel_reason": reason},
+                ),
+            )
+        await self._release_all_terminals(context, reason=reason)
+        self.cleanup_session(downstream_session_id, reason=reason)
+
     async def request_permission(self, **kwargs: Any) -> Any:
         context = self._require_context(kwargs)
         if not self.agent.capabilities.supports_permissions:
@@ -196,30 +219,48 @@ class _DownstreamCallbackLayer:
             metadata={"agent_id": self.agent.agent_id, "decision_source": "pending"},
         )
         self._persist_permission(context, request_state)
+        with self._lock:
+            self._pending_permissions[context.downstream_session_id].add(request_id)
         upstream_client = self._upstream_client_getter()
-        if upstream_client is not None and hasattr(upstream_client, "request_permission"):
-            response = await upstream_client.request_permission(**kwargs)
-            decision = self._extract_permission_decision(response)
-            request_state.status = "decided"
+        try:
+            if upstream_client is not None and hasattr(upstream_client, "request_permission"):
+                response = await upstream_client.request_permission(**kwargs)
+                if self._is_cancelled(context.downstream_session_id):
+                    request_state.status = "cancelled"
+                    request_state.decision = "cancelled"
+                    request_state.metadata["decision_source"] = "cancel"
+                    request_state.metadata["audit"] = {"request": payload, "decision": "cancelled"}
+                    self._persist_permission(context, request_state)
+                    return {"request_id": request_id, "decision": "cancelled"}
+                decision = self._extract_permission_decision(response)
+                request_state.status = "decided"
+                request_state.decision = decision
+                request_state.metadata["decision_source"] = "upstream"
+                request_state.metadata["audit"] = {
+                    "request": payload,
+                    "decision": decision,
+                    "response": _to_plain_data(response),
+                }
+                self._persist_permission(context, request_state)
+                return response
+            decision = self._headless_policy("session/request_permission", payload)
+            if self._is_cancelled(context.downstream_session_id):
+                decision = "cancelled"
+                request_state.status = "cancelled"
+                request_state.metadata["decision_source"] = "cancel"
+            else:
+                request_state.status = "decided"
+                request_state.metadata["decision_source"] = "headless_policy"
             request_state.decision = decision
-            request_state.metadata["decision_source"] = "upstream"
             request_state.metadata["audit"] = {
                 "request": payload,
                 "decision": decision,
-                "response": _to_plain_data(response),
             }
             self._persist_permission(context, request_state)
-            return response
-        decision = self._headless_policy("session/request_permission", payload)
-        request_state.status = "decided"
-        request_state.decision = decision
-        request_state.metadata["decision_source"] = "headless_policy"
-        request_state.metadata["audit"] = {
-            "request": payload,
-            "decision": decision,
-        }
-        self._persist_permission(context, request_state)
-        return {"request_id": request_id, "decision": decision}
+            return {"request_id": request_id, "decision": decision}
+        finally:
+            with self._lock:
+                self._pending_permissions.get(context.downstream_session_id, set()).discard(request_id)
 
     async def read_text_file(self, **kwargs: Any) -> Any:
         context = self._require_context(kwargs)
@@ -384,6 +425,35 @@ class _DownstreamCallbackLayer:
             process.release()
         self._mark_terminal_status(context, mapping, status="released", extra_metadata={"cleanup_reason": reason})
 
+    async def _release_all_terminals(self, context: _ExecutionContext, *, reason: str) -> None:
+        if self.store is None:
+            terminal_ids = [
+                terminal_id
+                for terminal_id, session_id in self._terminal_to_session.items()
+                if session_id == context.downstream_session_id
+            ]
+        else:
+            snapshot = self.store.load(context.orchestrator_session_id)
+            terminal_ids = []
+            if snapshot is not None:
+                terminal_ids = [
+                    mapping.downstream_terminal_id
+                    for mapping in snapshot.terminal_mappings
+                    if mapping.owner_task_id == context.task.task_id and mapping.owner_agent_id == self.agent.agent_id
+                ]
+        upstream_client = self._upstream_client_getter()
+        for terminal_id in terminal_ids:
+            try:
+                mapping = self._require_terminal_mapping(context, terminal_id, method="terminal/release")
+            except Exception:
+                continue
+            if upstream_client is not None and hasattr(upstream_client, "release_terminal"):
+                try:
+                    await upstream_client.release_terminal(terminal_id=mapping.upstream_terminal_id)
+                except Exception:
+                    pass
+            self._release_terminal(context, terminal_id=terminal_id, reason=reason, allow_missing=True)
+
     def _mark_terminal_status(
         self,
         context: _ExecutionContext,
@@ -494,6 +564,10 @@ class _DownstreamCallbackLayer:
         if self.store is None:
             return
         self.store.persist_permission_event(context.orchestrator_session_id, request)
+
+    def _is_cancelled(self, downstream_session_id: str) -> bool:
+        with self._lock:
+            return downstream_session_id in self._cancelled_sessions
 
     def _persist_terminal(self, context: _ExecutionContext, mapping: TerminalMapping) -> None:
         if self.store is None:
@@ -710,7 +784,7 @@ class AcpDownstreamConnector:
             await self._conn.cancel(session_id=downstream_session_id)
         finally:
             if self._callback_layer is not None:
-                self._callback_layer.cleanup_session(downstream_session_id, reason="cancel")
+                await self._callback_layer.cancel_session(downstream_session_id, reason="cancel")
 
     async def _discover_catalog_async(self, *, force: bool = False) -> dict[str, Any]:
         if self._conn is None:
@@ -762,9 +836,10 @@ class AcpDownstreamConnector:
             summary = _extract_summary(_to_plain_data(response), updates)
             if not summary:
                 summary = f"Downstream agent {self.agent.name} completed {task.title!r}."
+            stop_reason = _extract_stop_reason(_to_plain_data(response))
             return DownstreamPromptResult(
                 downstream_session_id=session_id,
-                status=TaskStatus.COMPLETED,
+                status=TaskStatus.CANCELLED if stop_reason == "cancelled" else TaskStatus.COMPLETED,
                 summary=summary,
                 raw_output=summary,
                 updates=updates,
@@ -965,6 +1040,13 @@ def _extract_summary(response: dict[str, Any], updates: list[dict[str, Any]]) ->
         if summary:
             return summary
     return ""
+
+
+def _extract_stop_reason(response: dict[str, Any]) -> str | None:
+    stop_reason = response.get("stop_reason") or response.get("stopReason")
+    if isinstance(stop_reason, str) and stop_reason:
+        return stop_reason
+    return None
 
 
 def _extract_text(payload: Any) -> str:

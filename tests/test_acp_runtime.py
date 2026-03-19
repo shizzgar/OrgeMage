@@ -1,7 +1,10 @@
 import asyncio
 from pathlib import Path
+import threading
 
 from orgemage.adapters.acp_sdk import AcpAgentRuntime
+from orgemage.acp.downstream_client import DownstreamPromptResult
+from orgemage.acp.manager import DownstreamConnectorManager
 from orgemage.models import AgentCapabilities, DownstreamAgentConfig, ModelOption
 from orgemage.orchestrator import Orchestrator
 from orgemage.state import SQLiteSessionStore
@@ -149,3 +152,75 @@ def test_acp_runtime_supports_session_loading_prompt_updates_and_cancel(tmp_path
     assert "message" in kinds
     assert kinds[-1] == "cancelled"
     assert orchestrator.load_session(connection.updates[0][0]).metadata["cancelled"] is True
+
+
+def test_acp_runtime_prompt_returns_cancelled_stop_reason_for_active_turn(tmp_path: Path) -> None:
+    from orgemage.models import TaskStatus
+
+    planning_started = threading.Event()
+    release_planning = threading.Event()
+
+    class _BlockingConnector:
+        def __init__(self, agent: DownstreamAgentConfig) -> None:
+            self.agent = agent
+            self.negotiated_state = None
+            self.cancel_calls: list[str] = []
+
+        def discover_catalog(self, *, force: bool = False) -> dict[str, object]:
+            del force
+            return {
+                "agent_id": self.agent.agent_id,
+                "config_options": [],
+                "capabilities": {},
+                "command_advertisements": [],
+            }
+
+        def mark_catalog_refresh_required(self) -> None:
+            return None
+
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+            if task._meta.get("phase") == "planning":
+                planning_started.set()
+                release_planning.wait(timeout=5)
+                return DownstreamPromptResult(
+                    downstream_session_id="runtime-cancel-session",
+                    status=TaskStatus.CANCELLED,
+                    summary="Turn cancelled.",
+                    response={"stop_reason": "cancelled", "message": {"content": [{"text": "Turn cancelled."}]}},
+                )
+            raise AssertionError("worker execution should not start after cancellation")
+
+        def cancel(self, downstream_session_id: str) -> None:
+            self.cancel_calls.append(downstream_session_id)
+            release_planning.set()
+
+    agents = _agents()
+    store = SQLiteSessionStore(tmp_path / "state.db")
+    manager = DownstreamConnectorManager(agents, connector_factory=_BlockingConnector, store=store)
+    orchestrator = Orchestrator(agents, store, connector_manager=manager)
+    runtime = AcpAgentRuntime(acp=_FakeAcp, orchestrator=orchestrator)
+    connection = _RecordingConnection()
+
+    async def scenario() -> None:
+        await runtime.initialize(7, client_connection=connection)
+        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex")
+
+        prompt_task = asyncio.create_task(
+            runtime.prompt(
+                created.session_id,
+                [_FakeAcp.TextBlock("Cancel this turn while planning is still running.")],
+            )
+        )
+        await asyncio.to_thread(planning_started.wait, 5)
+        await runtime.cancel(created.session_id)
+        response = await prompt_task
+        assert response.stop_reason == "cancelled"
+        assert response.message.content[0].text == "Turn cancelled."
+
+    asyncio.run(scenario())
+
+    snapshot = orchestrator.load_session(connection.updates[0][0])
+    assert snapshot.turns[-1].status.value == "cancelled"
+    assert snapshot.turns[-1].stop_reason == "cancelled"
+    assert any(update["sessionUpdate"] == "cancelled" for _, update in connection.updates)

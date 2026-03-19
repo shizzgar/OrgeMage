@@ -150,6 +150,12 @@ class DownstreamConnectorManager:
             selected_model=selected_model,
         )
         session.set_downstream_session_mapping(agent.agent_id, prompt_result.downstream_session_id)
+        if self._store is not None:
+            self._store.save_downstream_session_mapping(
+                session.session_id,
+                agent.agent_id,
+                prompt_result.downstream_session_id,
+            )
         negotiated = getattr(connector, "negotiated_state", None)
         if negotiated is not None:
             session.metadata.setdefault("downstream_negotiated", {})[agent.agent_id] = negotiated.to_dict()
