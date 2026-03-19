@@ -162,14 +162,29 @@ def synthesize_local_fallback_plan(
             _meta={"source": "local_fallback", "synthesized_locally": True},
         ),
     ]
+    task_dependencies = {
+        tasks[0].task_id: [],
+        tasks[1].task_id: [tasks[0].task_id],
+        tasks[2].task_id: [tasks[1].task_id],
+        tasks[3].task_id: [tasks[2].task_id],
+    }
+    title_dependencies = {
+        tasks[0].task_id: [],
+        tasks[1].task_id: [tasks[0].title],
+        tasks[2].task_id: [tasks[1].title],
+        tasks[3].task_id: [tasks[2].title],
+    }
+    for task in tasks:
+        task.dependency_ids = list(task_dependencies[task.task_id])
+
     normalized_plan = {
         "tasks": [
             {
                 "task_id": task.task_id,
                 "title": task.title,
                 "details": task.details,
-                "dependencies": [],
-                "dependency_ids": [],
+                "dependencies": list(title_dependencies[task.task_id]),
+                "dependency_ids": list(task.dependency_ids),
                 "required_capabilities": dict(task.required_capabilities),
                 "assignee_hints": list(task.assignee_hints),
                 "acceptable_models": list(task.acceptable_models),
