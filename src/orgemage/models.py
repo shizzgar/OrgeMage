@@ -479,10 +479,14 @@ class SessionHistoryEntry:
     created_at: float
     updated_at: float
     task_count: int
+    summary: str = ""
+    active_turn_id: str | None = None
+    active_turn_status: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_snapshot(cls, snapshot: SessionSnapshot) -> "SessionHistoryEntry":
+        active_turn = snapshot.active_turn()
         return cls(
             session_id=snapshot.session_id,
             title=snapshot.title,
@@ -492,6 +496,9 @@ class SessionHistoryEntry:
             created_at=snapshot.created_at,
             updated_at=snapshot.updated_at,
             task_count=len(snapshot.task_states),
+            summary=str(snapshot.metadata.get("session_summary", "")),
+            active_turn_id=active_turn.turn_id if active_turn is not None else None,
+            active_turn_status=(active_turn.status.value if active_turn is not None and isinstance(active_turn.status, TurnStatus) else str(active_turn.status)) if active_turn is not None else None,
             metadata=dict(snapshot.metadata),
         )
 

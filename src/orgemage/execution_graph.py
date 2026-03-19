@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from .debug import debug_event, get_logger
 from .models import (
     DownstreamAgentConfig,
     OrchestrationTurnState,
@@ -28,6 +29,8 @@ PersistTrace = Callable[[str, TraceCorrelationState], None]
 SaveDownstreamMapping = Callable[[str, str, str], None]
 IsCancelRequested = Callable[[], bool]
 CancelActiveWork = Callable[[], None]
+
+_LOG = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -160,6 +163,7 @@ class ExecutionGraphRunner:
 
     def _handle_result(self, task: PlanTask, result: WorkerResult) -> None:
         if self.is_cancel_requested():
+            debug_event(_LOG, "execution_graph.result.discarded", session_id=self.snapshot.session_id, task_id=task.task_id)
             return
         task.status = result.status
         task.output = result.summary
@@ -194,6 +198,7 @@ class ExecutionGraphRunner:
 
     async def _handle_cancellation(self) -> None:
         self._stop_scheduling = True
+        debug_event(_LOG, "execution_graph.cancel", session_id=self.snapshot.session_id, turn_id=self.turn.turn_id, inflight_task_ids=[task.task_id for task in self._inflight.values()])
         self.cancel_active_work()
         for future in self._inflight:
             future.cancel()

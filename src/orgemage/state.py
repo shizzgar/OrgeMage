@@ -10,6 +10,7 @@ from .models import (
     DownstreamSessionMapping,
     OrchestrationTurnState,
     PermissionRequestState,
+    SessionHistoryEntry,
     SessionSnapshot,
     TaskExecutionState,
     TaskStatus,
@@ -245,6 +246,21 @@ class SQLiteSessionStore:
                 snapshots.append(self._hydrate_snapshot(conn, row))
             return snapshots
 
+    def list_session_history(self) -> list[SessionHistoryEntry]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT session_id, cwd, selected_model, coordinator_agent_id, title,
+                       created_at, updated_at, task_graph_json, metadata_json
+                FROM sessions ORDER BY updated_at DESC
+                """
+            ).fetchall()
+            history: list[SessionHistoryEntry] = []
+            for row in rows:
+                self._migrate_legacy_session_state(conn, row)
+                history.append(self._hydrate_session_history_entry(conn, row))
+            return history
+
     def load_downstream_session_mapping(self, session_id: str, agent_id: str) -> DownstreamSessionMapping | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -470,6 +486,21 @@ class SQLiteSessionStore:
             trace_metadata=self._load_trace_metadata(conn, row["session_id"]),
         )
         return snapshot
+
+    def _hydrate_session_history_entry(self, conn: sqlite3.Connection, row: sqlite3.Row) -> SessionHistoryEntry:
+        snapshot = SessionSnapshot(
+            session_id=row["session_id"],
+            cwd=row["cwd"],
+            selected_model=row["selected_model"],
+            coordinator_agent_id=row["coordinator_agent_id"],
+            title=row["title"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            metadata=_loads_dict(row["metadata_json"]),
+            turns=self._load_turns(conn, row["session_id"]),
+            task_states=self._load_task_states(conn, row["session_id"]),
+        )
+        return SessionHistoryEntry.from_snapshot(snapshot)
 
     def _migrate_legacy_session_state(self, conn: sqlite3.Connection, row: sqlite3.Row) -> None:
         session_id = row["session_id"]

@@ -3,12 +3,14 @@ from __future__ import annotations
 from typing import Callable
 
 from ..catalog import FederatedModelCatalog
+from ..debug import debug_event, get_logger
 from ..downstream import MockDownstreamClient
 from ..models import DownstreamAgentConfig, SessionSnapshot, PlanTask, WorkerResult
 from ..state import SQLiteSessionStore
 from .downstream_client import AcpDownstreamConnector, DownstreamConnector, DownstreamPromptResult
 
 ConnectorFactory = Callable[[DownstreamAgentConfig], DownstreamConnector]
+_LOG = get_logger(__name__)
 
 
 class _MockConnectorAdapter:
@@ -105,6 +107,7 @@ class DownstreamConnectorManager:
         if connector is None:
             agent = self._agents[agent_id]
             connector = self._connector_factory(agent)
+            debug_event(_LOG, "connector.manager.create", agent_id=agent_id, runtime=agent.runtime)
             self._connectors[agent_id] = connector
         return connector
 
@@ -119,6 +122,7 @@ class DownstreamConnectorManager:
         for current_agent_id in target_ids:
             connector = self.get_connector(current_agent_id)
             try:
+                debug_event(_LOG, "connector.manager.refresh_catalog", agent_id=current_agent_id, force=force)
                 payload = connector.discover_catalog(force=force)
             except Exception as exc:
                 catalog.record_discovery_failure(current_agent_id, str(exc))
@@ -141,6 +145,7 @@ class DownstreamConnectorManager:
     ) -> WorkerResult:
         connector = self.get_connector(agent.agent_id)
         downstream_session_id = session.get_downstream_session_id(agent.agent_id)
+        debug_event(_LOG, "connector.manager.execute", session_id=session.session_id, task_id=task.task_id, agent_id=agent.agent_id, downstream_session_id=downstream_session_id)
         prompt_result = connector.execute_task(
             orchestrator_session_id=session.session_id,
             downstream_session_id=downstream_session_id,
@@ -169,6 +174,7 @@ class DownstreamConnectorManager:
                 "downstream_session_id": prompt_result.downstream_session_id,
                 "updates": prompt_result.updates,
                 "response": prompt_result.response,
+                "promptMetadata": dict(task._meta),
             },
         )
 
@@ -179,6 +185,7 @@ class DownstreamConnectorManager:
             downstream_session_id = mappings.get(current_agent_id)
             if downstream_session_id is None:
                 continue
+            debug_event(_LOG, "connector.manager.cancel", session_id=session.session_id, agent_id=current_agent_id, downstream_session_id=downstream_session_id)
             self.get_connector(current_agent_id).cancel(downstream_session_id)
 
     def mark_catalog_refresh_required(self, agent_id: str) -> None:
