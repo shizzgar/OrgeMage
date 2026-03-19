@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from .acp.manager import DownstreamConnectorManager
 from .catalog import FederatedModelCatalog
+from .execution_graph import ExecutionGraphRunner
 from .models import (
     DownstreamAgentConfig,
     OrchestrationTurnState,
@@ -501,74 +502,78 @@ class Orchestrator:
         turn: OrchestrationTurnState,
         emit_update: SessionUpdateCallback | None,
     ) -> list[ToolEvent]:
-        events: list[ToolEvent] = []
         coordinator_prompt = self._coordinator_instruction(user_prompt)
-        agents_by_id = {agent.agent_id: agent for agent in self.catalog.agents}
-        for task in tasks:
-            task.status = TaskStatus.IN_PROGRESS
-            task_state = snapshot.get_task_state(task.task_id) or TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id)
-            task_state.status = task.status
-            task_state.assignee = task.assignee
-            task_state.dependency_state = "blocked" if task.dependency_ids else "ready"
-            self.store.persist_task_update(snapshot.session_id, task_state)
-            snapshot.upsert_task_state(task_state)
-            self._emit_update(self.normalizer.plan_update(snapshot, tasks), emit_update)
-            started_event = self.normalizer.delegate_started_event(task)
-            events.append(started_event)
-            self._emit_update(self.normalizer.tool_call_update(snapshot, task, started_event), emit_update)
-            agent = agents_by_id[task.assignee or coordinator_agent.agent_id]
-            result = self.connector_manager.execute_task(
-                session=snapshot,
-                task=task,
-                coordinator_prompt=coordinator_prompt,
-                selected_model=selected_model,
-                agent=agent,
-            )
-            downstream_session_id = result.metadata.get("downstream_session_id")
-            if isinstance(downstream_session_id, str):
-                self.store.save_downstream_session_mapping(snapshot.session_id, agent.agent_id, downstream_session_id)
-            negotiated = snapshot.metadata.get("downstream_negotiated", {}).get(agent.agent_id)
-            if negotiated is not None:
-                self.store.persist_trace_metadata(
-                    snapshot.session_id,
-                    TraceCorrelationState(
-                        trace_key=f"negotiated:{agent.agent_id}",
-                        task_id=task.task_id,
-                        turn_id=turn.turn_id,
-                        metadata={"agent_id": agent.agent_id, "negotiated": negotiated},
-                    ),
-                )
-            rebased_updates = self.normalizer.normalize_worker_updates(
+        runner = ExecutionGraphRunner(
+            snapshot=snapshot,
+            tasks=tasks,
+            turn=turn,
+            coordinator_agent=coordinator_agent,
+            agents=self.catalog.agents,
+            selected_model=selected_model,
+            coordinator_prompt=coordinator_prompt,
+            persist_task_state=lambda task, reason, result=None, dependency_state=None: self._persist_task_state(
                 snapshot=snapshot,
                 task=task,
+                turn=turn,
+                status_reason=reason,
+                result=result,
+                dependency_state=dependency_state,
+            ),
+            execute_task=lambda current_snapshot, task, prompt, model, agent: self.connector_manager.execute_task(
+                session=current_snapshot,
+                task=task,
+                coordinator_prompt=prompt,
+                selected_model=model,
                 agent=agent,
-                updates=result.metadata.get("updates", []),
-            )
-            for update in rebased_updates:
-                self._emit_update(update, emit_update)
-            task.status = result.status
-            task.output = result.summary
-            task_state = snapshot.get_task_state(task.task_id) or TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id)
-            task_state.status = result.status
-            task_state.output = result.summary
-            task_state.assignee = task.assignee
-            task_state.plan_metadata.update(
-                {
-                    "assignee_hints": list(task.assignee_hints),
-                    "_meta": dict(task._meta),
-                    "worker_result": {
-                        **dict(result.metadata),
-                        "raw_output": result.raw_output,
-                    },
-                }
-            )
-            self.store.persist_task_update(snapshot.session_id, task_state)
-            snapshot.upsert_task_state(task_state)
-            self._emit_update(self.normalizer.plan_update(snapshot, tasks), emit_update)
-            finished_event = self.normalizer.delegate_finished_event(task, status=result.status, content=result.summary)
-            events.append(finished_event)
-            self._emit_update(self.normalizer.tool_call_update(snapshot, task, finished_event), emit_update)
-        return events
+            ),
+            normalize_worker_updates=lambda current_snapshot, task, agent, updates: self.normalizer.normalize_worker_updates(
+                snapshot=current_snapshot,
+                task=task,
+                agent=agent,
+                updates=updates,
+            ),
+            emit_plan_update=lambda: self._emit_update(self.normalizer.plan_update(snapshot, tasks), emit_update),
+            emit_generic_update=lambda update: self._emit_update(update, emit_update),
+            emit_tool_event=lambda task, event: self._emit_update(self.normalizer.tool_call_update(snapshot, task, event), emit_update),
+            create_started_event=self.normalizer.delegate_started_event,
+            create_finished_event=lambda task, status, content: self.normalizer.delegate_finished_event(task, status=status, content=content),
+            persist_trace=self.store.persist_trace_metadata,
+            save_downstream_mapping=self.store.save_downstream_session_mapping,
+        )
+        return runner.run()
+
+
+    def _persist_task_state(
+        self,
+        *,
+        snapshot: SessionSnapshot,
+        task: PlanTask,
+        turn: OrchestrationTurnState,
+        status_reason: str | None = None,
+        result: Any | None = None,
+        dependency_state: str | None = None,
+    ) -> TaskExecutionState:
+        task_state = snapshot.get_task_state(task.task_id) or TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id)
+        task_state.status = task.status
+        task_state.output = task.output
+        task_state.assignee = task.assignee
+        task_state.dependency_state = dependency_state or ("blocked" if task.dependency_ids else "ready")
+        task_state.plan_metadata.update(
+            {
+                "assignee_hints": list(task.assignee_hints),
+                "_meta": dict(task._meta),
+            }
+        )
+        if status_reason is not None:
+            task_state.plan_metadata["status_reason"] = status_reason
+        if result is not None:
+            task_state.plan_metadata["worker_result"] = {
+                **dict(result.metadata),
+                "raw_output": result.raw_output,
+            }
+        self.store.persist_task_update(snapshot.session_id, task_state)
+        snapshot.upsert_task_state(task_state)
+        return task_state
 
     def _coordinator_instruction(self, user_prompt: str) -> str:
         return textwrap.dedent(

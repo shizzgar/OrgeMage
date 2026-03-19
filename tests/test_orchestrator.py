@@ -144,3 +144,245 @@ def test_orchestrator_streaming_api_rebases_worker_updates_and_emits_file_follow
     assert updates[-1]["sessionUpdate"] == "message"
     assert updates[-1]["message"]["role"] == "assistant"
     assert orchestrator.load_session(session.session_id).terminal_mappings[0].upstream_terminal_id == "up-term-7"
+
+
+def test_orchestrator_runs_ready_tasks_in_parallel_and_unblocks_dependencies(tmp_path: Path) -> None:
+    import json
+    import threading
+    import time
+
+    from orgemage.acp.downstream_client import DownstreamPromptResult
+    from orgemage.acp.manager import DownstreamConnectorManager
+    from orgemage.models import TaskStatus
+
+    active_lock = threading.Lock()
+    active_workers = 0
+    max_parallelism = 0
+
+    class _ParallelConnector:
+        def __init__(self, agent: DownstreamAgentConfig) -> None:
+            self.agent = agent
+            self.negotiated_state = None
+            self.started: dict[str, float] = {}
+            self.finished: dict[str, float] = {}
+
+        def discover_catalog(self, *, force: bool = False) -> dict[str, object]:
+            del force
+            return {
+                "agent_id": self.agent.agent_id,
+                "config_options": [],
+                "capabilities": {},
+                "command_advertisements": [],
+            }
+
+        def mark_catalog_refresh_required(self) -> None:
+            return None
+
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+            if task._meta.get("phase") == "planning":
+                return DownstreamPromptResult(
+                    downstream_session_id="parallel-session",
+                    status=TaskStatus.COMPLETED,
+                    summary="Generated structured orchestration plan.",
+                    raw_output=json.dumps(
+                        {
+                            "tasks": [
+                                {
+                                    "title": "Task A",
+                                    "details": "Run branch A.",
+                                    "dependencies": [],
+                                    "required_capabilities": {"needsTerminal": True},
+                                    "assignee_hints": ["codex"],
+                                    "acceptable_models": [],
+                                    "priority": 90,
+                                    "_meta": {},
+                                },
+                                {
+                                    "title": "Task B",
+                                    "details": "Run branch B.",
+                                    "dependencies": [],
+                                    "required_capabilities": {"needsTerminal": True},
+                                    "assignee_hints": ["qwen"],
+                                    "acceptable_models": [],
+                                    "priority": 80,
+                                    "_meta": {},
+                                },
+                                {
+                                    "title": "Task C",
+                                    "details": "Join both branches.",
+                                    "dependencies": ["Task A", "Task B"],
+                                    "required_capabilities": {"needsFilesystem": True},
+                                    "assignee_hints": ["codex"],
+                                    "acceptable_models": [],
+                                    "priority": 70,
+                                    "_meta": {},
+                                },
+                            ],
+                            "_meta": {"planner": "test"},
+                        }
+                    ),
+                )
+            nonlocal active_workers, max_parallelism
+            with active_lock:
+                active_workers += 1
+                max_parallelism = max(max_parallelism, active_workers)
+                self.started[task.title] = time.monotonic()
+            time.sleep(0.15)
+            with active_lock:
+                active_workers -= 1
+                self.finished[task.title] = time.monotonic()
+            return DownstreamPromptResult(
+                downstream_session_id=f"parallel-{self.agent.agent_id}",
+                status=TaskStatus.COMPLETED,
+                summary=f"{task.title} complete",
+            )
+
+        def cancel(self, downstream_session_id: str) -> None:
+            del downstream_session_id
+            return None
+
+    created: list[_ParallelConnector] = []
+
+    def factory(agent: DownstreamAgentConfig) -> _ParallelConnector:
+        connector = _ParallelConnector(agent)
+        created.append(connector)
+        return connector
+
+    manager = DownstreamConnectorManager(_agents(), connector_factory=factory)
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"), connector_manager=manager)
+    session = orchestrator.create_session(tmp_path.as_posix(), "codex::gpt-5-codex")
+    updates: list[dict[str, object]] = []
+
+    result = orchestrator.orchestrate_turn(session.session_id, "Run parallel execution.", emit_update=updates.append)
+
+    assert result["summary"] == "Completed 3/3 orchestrated tasks."
+    plan_by_title = {task["title"]: task for task in result["plan"]}
+    assert plan_by_title["Task C"]["dependency_ids"] == [plan_by_title["Task A"]["task_id"], plan_by_title["Task B"]["task_id"]]
+    plan_updates = [update for update in updates if update["sessionUpdate"] == "plan"]
+    assert len(plan_updates) >= 4
+    task_c_states = [
+        next(task for task in update["plan"] if task["title"] == "Task C")
+        for update in plan_updates
+        if any(task["title"] == "Task C" for task in update["plan"])
+    ]
+    assert task_c_states[0]["status"] == "pending"
+    assert task_c_states[0]["dependency_ids"]
+    assert any(task["status"] == "in_progress" for task in task_c_states)
+    starts = {title: timestamp for connector in created for title, timestamp in connector.started.items()}
+    finishes = {title: timestamp for connector in created for title, timestamp in connector.finished.items()}
+    assert max_parallelism >= 2
+    assert starts["Task C"] >= finishes["Task A"]
+    assert starts["Task C"] >= finishes["Task B"]
+
+
+
+def test_orchestrator_applies_fail_fast_and_continue_failure_policies(tmp_path: Path) -> None:
+    import json
+
+    from orgemage.acp.downstream_client import DownstreamPromptResult
+    from orgemage.acp.manager import DownstreamConnectorManager
+    from orgemage.models import TaskStatus
+
+    class _PolicyConnector:
+        def __init__(self, agent: DownstreamAgentConfig) -> None:
+            self.agent = agent
+            self.negotiated_state = None
+
+        def discover_catalog(self, *, force: bool = False) -> dict[str, object]:
+            del force
+            return {
+                "agent_id": self.agent.agent_id,
+                "config_options": [],
+                "capabilities": {},
+                "command_advertisements": [],
+            }
+
+        def mark_catalog_refresh_required(self) -> None:
+            return None
+
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+            if task._meta.get("phase") == "planning":
+                return DownstreamPromptResult(
+                    downstream_session_id="policy-session",
+                    status=TaskStatus.COMPLETED,
+                    summary="Generated structured orchestration plan.",
+                    raw_output=json.dumps(
+                        {
+                            "tasks": [
+                                {
+                                    "title": "Critical task",
+                                    "details": "This coordinator-critical task fails.",
+                                    "dependencies": [],
+                                    "required_capabilities": {"needsFilesystem": True},
+                                    "assignee_hints": ["codex"],
+                                    "acceptable_models": [],
+                                    "priority": 90,
+                                    "_meta": {"coordinator_critical": True, "execution_role": "coordinator"},
+                                },
+                                {
+                                    "title": "Blocked dependent",
+                                    "details": "Should never start after fail-fast.",
+                                    "dependencies": ["Critical task"],
+                                    "required_capabilities": {"needsFilesystem": True},
+                                    "assignee_hints": ["qwen"],
+                                    "acceptable_models": [],
+                                    "priority": 80,
+                                    "_meta": {},
+                                },
+                                {
+                                    "title": "Worker failure",
+                                    "details": "Fails but should not stop independent work.",
+                                    "dependencies": [],
+                                    "required_capabilities": {"needsTerminal": True},
+                                    "assignee_hints": ["qwen"],
+                                    "acceptable_models": [],
+                                    "priority": 70,
+                                    "_meta": {"failure_policy": "continue"},
+                                },
+                                {
+                                    "title": "Independent success",
+                                    "details": "Continues despite worker failure.",
+                                    "dependencies": [],
+                                    "required_capabilities": {"needsTerminal": True},
+                                    "assignee_hints": ["codex"],
+                                    "acceptable_models": [],
+                                    "priority": 60,
+                                    "_meta": {"failure_policy": "continue"},
+                                },
+                            ],
+                            "_meta": {"planner": "test"},
+                        }
+                    ),
+                )
+            status_map = {
+                "Critical task": TaskStatus.FAILED,
+                "Worker failure": TaskStatus.FAILED,
+                "Independent success": TaskStatus.COMPLETED,
+            }
+            return DownstreamPromptResult(
+                downstream_session_id=f"policy-{self.agent.agent_id}",
+                status=status_map[task.title],
+                summary=f"{task.title} -> {status_map[task.title].value}",
+            )
+
+        def cancel(self, downstream_session_id: str) -> None:
+            del downstream_session_id
+            return None
+
+    manager = DownstreamConnectorManager(_agents(), connector_factory=_PolicyConnector)
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"), connector_manager=manager)
+    session = orchestrator.create_session(tmp_path.as_posix(), "codex::gpt-5-codex")
+
+    result = orchestrator.orchestrate_turn(session.session_id, "Exercise failure policies.")
+
+    plan_by_title = {task["title"]: task for task in result["plan"]}
+    assert plan_by_title["Critical task"]["status"] == "failed"
+    assert plan_by_title["Blocked dependent"]["status"] == "cancelled"
+    assert plan_by_title["Worker failure"]["status"] == "failed"
+    assert plan_by_title["Independent success"]["status"] == "completed"
+    session_snapshot = orchestrator.load_session(session.session_id)
+    states = {task.title: task for task in session_snapshot.task_states}
+    assert states["Blocked dependent"].plan_metadata["status_reason"] in {"fail_fast", "dependency_failure"}
+    assert states["Blocked dependent"].dependency_state == "blocked"
