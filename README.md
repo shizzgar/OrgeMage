@@ -57,7 +57,7 @@ This prints the top-level commands:
 
 By default, OrgeMage bootstraps three downstream agents:
 
-- `codex`
+- `codex` (spawned through `codex-acp` in ACP mode)
 - `gemini`
 - `qwen`
 
@@ -108,7 +108,7 @@ orgemage \
   "Implement the ACP orchestrator and validate it."
 ```
 
-Before running this mode, make sure the downstream commands referenced by your config are installed and available on `PATH`.
+Before running this mode, make sure the downstream commands referenced by your config are installed and available on `PATH`. For Codex, the ACP entrypoint is `codex-acp`, not the raw `codex` CLI.
 
 ### 5. Create and reuse sessions explicitly
 
@@ -191,7 +191,7 @@ Example `orgemage-agents.json`:
     {
       "agent_id": "codex",
       "name": "Codex",
-      "command": "/absolute/path/to/codex",
+      "command": "/absolute/path/to/codex-acp",
       "args": [],
       "description": "OpenAI coding agent",
       "default_model": "gpt-5-codex",
@@ -218,9 +218,15 @@ Example `orgemage-agents.json`:
 
 By default the CLI bootstraps three downstream agents from the design documents:
 
-- Codex
-- Gemini CLI
-- Qwen Code
+- Codex via `codex-acp`
+- Gemini CLI via `gemini --experimental-acp`
+- Qwen Code via `qwen --acp`
+
+You can override the default Codex bridge path with `ORGEMAGE_CODEX_ACP_COMMAND=/custom/path/to/codex-acp`.
+
+> Warning: `codex-acp` and `codex` are different roles. `codex-acp` is the ACP bridge that OrgeMage can launch as a downstream ACP peer; raw `codex` is not guaranteed to expose ACP transport on stdio.
+
+When `runtime` is `"acp"`, OrgeMage validates that the configured command looks like an ACP-compatible entrypoint. Known-good defaults are `codex-acp`, `gemini --experimental-acp`, and `qwen --acp`. For custom wrappers, set `"metadata": {"acp_entrypoint": true}` to opt in explicitly.
 
 You can also pass `--config path/to/agents.json` with this shape:
 
@@ -230,8 +236,8 @@ You can also pass `--config path/to/agents.json` with this shape:
     {
       "agent_id": "codex",
       "name": "Codex",
-      "command": "codex",
-      "args": ["--some-flag"],
+      "command": "codex-acp",
+      "args": [],
       "description": "OpenAI coding agent",
       "default_model": "gpt-5-codex",
       "runtime": "acp",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,13 +14,16 @@ from .state import SQLiteSessionStore
 
 def _default_agents(mock_downstream: bool = False) -> list[DownstreamAgentConfig]:
     runtime = "mock" if mock_downstream else "acp"
+    codex_command = os.environ.get("ORGEMAGE_CODEX_ACP_COMMAND", "codex-acp")
     return [
         DownstreamAgentConfig(
             agent_id="codex",
             name="Codex",
-            command="codex",
+            command=codex_command,
             models=[
-                ModelOption("gpt-5-codex", "GPT-5 Codex", "Strong coordinator and coding model."),
+                ModelOption(
+                    "gpt-5-codex", "GPT-5 Codex", "Strong coordinator and coding model."
+                ),
             ],
             capabilities=AgentCapabilities(
                 supports_terminal=True,
@@ -38,7 +42,11 @@ def _default_agents(mock_downstream: bool = False) -> list[DownstreamAgentConfig
             command="gemini",
             args=["--experimental-acp"],
             models=[
-                ModelOption("gemini-2.5-pro", "Gemini 2.5 Pro", "Strong planner and research model."),
+                ModelOption(
+                    "gemini-2.5-pro",
+                    "Gemini 2.5 Pro",
+                    "Strong planner and research model.",
+                ),
             ],
             capabilities=AgentCapabilities(
                 supports_terminal=True,
@@ -56,7 +64,11 @@ def _default_agents(mock_downstream: bool = False) -> list[DownstreamAgentConfig
             command="qwen",
             args=["--acp"],
             models=[
-                ModelOption("qwen3-coder-plus", "Qwen3 Coder Plus", "Efficient worker model for implementation."),
+                ModelOption(
+                    "qwen3-coder-plus",
+                    "Qwen3 Coder Plus",
+                    "Efficient worker model for implementation.",
+                ),
             ],
             capabilities=AgentCapabilities(
                 supports_terminal=True,
@@ -71,9 +83,43 @@ def _default_agents(mock_downstream: bool = False) -> list[DownstreamAgentConfig
     ]
 
 
-def _load_config(path: str | None, mock_downstream: bool = False) -> list[DownstreamAgentConfig]:
+def _is_known_acp_entrypoint(agent: DownstreamAgentConfig) -> bool:
+    command_name = Path(agent.command).name
+    if agent.metadata.get("acp_compatible") or agent.metadata.get("acp_entrypoint"):
+        return True
+    if agent.agent_id == "codex":
+        return command_name == "codex-acp"
+    if agent.agent_id == "gemini":
+        return command_name == "gemini" and "--experimental-acp" in agent.args
+    if agent.agent_id == "qwen":
+        return command_name == "qwen" and "--acp" in agent.args
+    return "acp" in command_name
+
+
+def _validate_agents(
+    agents: list[DownstreamAgentConfig],
+) -> list[DownstreamAgentConfig]:
+    for agent in agents:
+        if agent.runtime != "acp":
+            continue
+        command_name = Path(agent.command).name
+        if agent.agent_id == "codex" and command_name == "codex":
+            raise ValueError(
+                "Codex ACP downstreams must use 'codex-acp' (or another ACP bridge marked with metadata.acp_entrypoint=true), not raw 'codex'."
+            )
+        if not _is_known_acp_entrypoint(agent):
+            raise ValueError(
+                f"Downstream agent {agent.agent_id!r} is configured with runtime='acp' but command {agent.command!r} does not look like an ACP-compatible entrypoint. "
+                "Use a known ACP bridge such as codex-acp, gemini --experimental-acp, qwen --acp, or set metadata.acp_entrypoint=true for a custom wrapper."
+            )
+    return agents
+
+
+def _load_config(
+    path: str | None, mock_downstream: bool = False
+) -> list[DownstreamAgentConfig]:
     if path is None:
-        return _default_agents(mock_downstream=mock_downstream)
+        return _validate_agents(_default_agents(mock_downstream=mock_downstream))
     payload = json.loads(Path(path).read_text())
     agents: list[DownstreamAgentConfig] = []
     for item in payload["agents"]:
@@ -94,12 +140,22 @@ def _load_config(path: str | None, mock_downstream: bool = False) -> list[Downst
                 metadata=item.get("metadata", {}),
             )
         )
-    return agents
+    return _validate_agents(agents)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OrgeMage ACP orchestrator")
-    parser.add_argument("--config", help="JSON file describing downstream agents")
+    parser = argparse.ArgumentParser(
+        description="OrgeMage ACP orchestrator",
+        epilog=(
+            "ACP downstream note: codex-acp is the ACP bridge for Codex. "
+            "Raw 'codex' is not guaranteed to be an ACP transport endpoint; use codex-acp, "
+            "gemini --experimental-acp, qwen --acp, or a custom wrapper marked metadata.acp_entrypoint=true."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        help="JSON file describing downstream agents; ACP runtime entries must point at ACP-compatible entrypoints such as codex-acp.",
+    )
     parser.add_argument("--db", default=":memory:", help="SQLite database path")
     parser.add_argument(
         "--mock-downstream",
@@ -120,7 +176,11 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("prompt")
 
     acp_parser = subparsers.add_parser("acp", help="Create an ACP agent instance")
-    acp_parser.add_argument("--check", action="store_true", help="Only verify that ACP SDK support is available")
+    acp_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Only verify that ACP SDK support is available",
+    )
     acp_parser.add_argument(
         "--stdio",
         action="store_true",
@@ -149,7 +209,9 @@ def main() -> None:
 
     if args.command == "session":
         session = orchestrator.create_session(args.cwd, args.model)
-        _emit({"session_id": session.session_id, "selected_model": session.selected_model})
+        _emit(
+            {"session_id": session.session_id, "selected_model": session.selected_model}
+        )
         return
 
     if args.command == "run":
@@ -174,7 +236,13 @@ def main() -> None:
 
             asyncio.run(acp.run_agent(runtime.agent))
             return
-        _emit({"agent": runtime.agent.__class__.__name__, "runtime": runtime.__class__.__name__, "acp_sdk_available": True})
+        _emit(
+            {
+                "agent": runtime.agent.__class__.__name__,
+                "runtime": runtime.__class__.__name__,
+                "acp_sdk_available": True,
+            }
+        )
         return
 
     parser.error(f"Unknown command: {args.command}")

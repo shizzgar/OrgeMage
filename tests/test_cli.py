@@ -35,3 +35,71 @@ def test_main_runs_acp_stdio_agent(monkeypatch) -> None:
     cli.main()
 
     assert calls == ["fake-agent"]
+
+
+def test_default_agents_use_codex_acp(monkeypatch) -> None:
+    monkeypatch.delenv("ORGEMAGE_CODEX_ACP_COMMAND", raising=False)
+
+    agents = cli._default_agents()
+
+    codex = next(agent for agent in agents if agent.agent_id == "codex")
+    assert codex.command == "codex-acp"
+
+
+def test_default_agents_allow_codex_acp_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("ORGEMAGE_CODEX_ACP_COMMAND", "/tmp/custom-codex-acp")
+
+    agents = cli._default_agents()
+
+    codex = next(agent for agent in agents if agent.agent_id == "codex")
+    assert codex.command == "/tmp/custom-codex-acp"
+
+
+def test_load_config_rejects_raw_codex_for_acp_runtime(tmp_path) -> None:
+    config_path = tmp_path / "agents.json"
+    config_path.write_text(
+        """
+{
+  "agents": [
+    {
+      "agent_id": "codex",
+      "name": "Codex",
+      "command": "codex",
+      "runtime": "acp"
+    }
+  ]
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    try:
+        cli._load_config(str(config_path))
+    except ValueError as exc:
+        assert "codex-acp" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("Expected ACP validation to reject raw codex")
+
+
+def test_load_config_allows_custom_acp_wrapper_with_metadata(tmp_path) -> None:
+    config_path = tmp_path / "agents.json"
+    config_path.write_text(
+        """
+{
+  "agents": [
+    {
+      "agent_id": "codex",
+      "name": "Codex",
+      "command": "/opt/bin/custom-codex-wrapper",
+      "runtime": "acp",
+      "metadata": {"acp_entrypoint": true}
+    }
+  ]
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    agents = cli._load_config(str(config_path))
+
+    assert agents[0].command == "/opt/bin/custom-codex-wrapper"
