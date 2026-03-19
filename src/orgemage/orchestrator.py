@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from pathlib import Path
 import textwrap
+import threading
 import uuid
 from typing import Any, Callable
 
@@ -20,6 +21,7 @@ from .models import (
     TerminalMapping,
     ToolEvent,
     TraceCorrelationState,
+    TurnStatus,
 )
 from .planning import PlanParseResult, parse_coordinator_plan, synthesize_local_fallback_plan
 from .scheduler import Scheduler
@@ -283,6 +285,9 @@ class Orchestrator:
         self.connector_manager = connector_manager or DownstreamConnectorManager(agents, store=self.store)
         self.scheduler = Scheduler()
         self.normalizer = OrchestrationEventNormalizer(self.store)
+        self._turn_control_lock = threading.Lock()
+        self._turn_cancel_events: dict[tuple[str, str], threading.Event] = {}
+        self._active_turn_by_session: dict[str, str] = {}
 
     def create_session(self, cwd: str, selected_model: str | None = None) -> SessionSnapshot:
         normalized_cwd = str(Path(cwd).resolve())
@@ -308,12 +313,17 @@ class Orchestrator:
 
     def session_info(self, session_id: str) -> dict[str, Any]:
         snapshot = self._require_session(session_id)
+        active_turn = snapshot.active_turn()
         return {
             "session_id": snapshot.session_id,
             "title": snapshot.title,
             "cwd": snapshot.cwd,
             "selected_model": snapshot.selected_model,
             "coordinator_agent_id": snapshot.coordinator_agent_id,
+            "active_turn_id": active_turn.turn_id if active_turn is not None else None,
+            "active_turn_status": (
+                active_turn.status.value if active_turn is not None and isinstance(active_turn.status, TurnStatus) else active_turn.status
+            ) if active_turn is not None else None,
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
             "task_count": len(snapshot.task_states),
@@ -375,55 +385,77 @@ class Orchestrator:
         self._refresh_catalog_for_model(snapshot.selected_model or "")
         resolved = self.catalog.resolve(snapshot.selected_model or "")
 
-        turn = OrchestrationTurnState(status="running", turn_id=f"turn-{uuid.uuid4().hex[:12]}")
+        turn = OrchestrationTurnState(status=TurnStatus.RUNNING, turn_id=f"turn-{uuid.uuid4().hex[:12]}")
         snapshot.turns.append(turn)
         self.store.create_or_update_turn_state(snapshot.session_id, turn)
+        cancel_event = self._register_turn(session_id, turn.turn_id)
 
-        plan_parse_result, planner_record = self._generate_plan(
-            snapshot=snapshot,
-            selected_model=resolved.option.value,
-            coordinator_agent=resolved.agent,
-            user_prompt=user_prompt,
-            turn=turn,
-        )
-        plan = self.scheduler.assign_tasks(plan_parse_result.tasks, self.catalog.agents, resolved.agent.agent_id)
-        snapshot.task_states = [TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id) for task in plan]
-        for task_state in snapshot.task_states:
-            self.store.persist_task_update(snapshot.session_id, task_state)
-        self.store.save(snapshot)
-        self._emit_update(self.normalizer.plan_update(snapshot, plan), emit_update)
+        try:
+            plan_parse_result, planner_record = self._generate_plan(
+                snapshot=snapshot,
+                selected_model=resolved.option.value,
+                coordinator_agent=resolved.agent,
+                user_prompt=user_prompt,
+                turn=turn,
+            )
+            if planner_record["planner_result"]["status"] == TaskStatus.CANCELLED.value:
+                cancel_event.set()
+            if cancel_event.is_set():
+                plan: list[PlanTask] = []
+                tool_events: list[ToolEvent] = []
+            else:
+                plan = self.scheduler.assign_tasks(plan_parse_result.tasks, self.catalog.agents, resolved.agent.agent_id)
+                snapshot.task_states = [TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id) for task in plan]
+                for task_state in snapshot.task_states:
+                    self.store.persist_task_update(snapshot.session_id, task_state)
+                self.store.save(snapshot)
+                self._emit_update(self.normalizer.plan_update(snapshot, plan), emit_update)
 
-        tool_events = self._run_tasks(
-            snapshot=snapshot,
-            selected_model=resolved.option.value,
-            coordinator_agent=resolved.agent,
-            user_prompt=user_prompt,
-            tasks=plan,
-            turn=turn,
-            emit_update=emit_update,
-        )
-        turn.status = "completed"
-        turn.stop_reason = "end_turn"
-        self.store.create_or_update_turn_state(snapshot.session_id, turn)
-        self.store.save(snapshot)
-        snapshot = self._require_session(session_id)
-        summary = self._final_summary(plan)
-        result = {
-            "session": snapshot.to_dict(),
-            "coordinator": {
-                "agent_id": resolved.agent.agent_id,
-                "agent_name": resolved.agent.name,
-                "model": resolved.option.value,
-                "composite_model": resolved.composite_value,
-            },
-            "planning": planner_record,
-            "plan": [task.to_dict() for task in plan],
-            "global_plan": [task.to_acp_plan_item() for task in plan],
-            "tool_events": [event.to_dict() for event in tool_events],
-            "summary": summary,
-        }
-        self._emit_update(self.normalizer.message_update(snapshot, summary, result, plan), emit_update)
-        return result
+                tool_events = self._run_tasks(
+                    snapshot=snapshot,
+                    selected_model=resolved.option.value,
+                    coordinator_agent=resolved.agent,
+                    user_prompt=user_prompt,
+                    tasks=plan,
+                    turn=turn,
+                    emit_update=emit_update,
+                    cancel_event=cancel_event,
+                )
+            if cancel_event.is_set():
+                turn.status = TurnStatus.CANCELLED
+                turn.stop_reason = "cancelled"
+            else:
+                turn.status = TurnStatus.COMPLETED
+                turn.stop_reason = "end_turn"
+            self.store.create_or_update_turn_state(snapshot.session_id, turn)
+            self.store.save(snapshot)
+            snapshot = self._require_session(session_id)
+            summary = self._final_summary(plan, cancelled=cancel_event.is_set())
+            result = {
+                "session": snapshot.to_dict(),
+                "coordinator": {
+                    "agent_id": resolved.agent.agent_id,
+                    "agent_name": resolved.agent.name,
+                    "model": resolved.option.value,
+                    "composite_model": resolved.composite_value,
+                },
+                "planning": planner_record,
+                "plan": [task.to_dict() for task in plan],
+                "global_plan": [task.to_acp_plan_item() for task in plan],
+                "tool_events": [event.to_dict() for event in tool_events],
+                "summary": summary,
+                "stop_reason": turn.stop_reason,
+            }
+            self._emit_update(self.normalizer.message_update(snapshot, summary, result, plan), emit_update)
+            return result
+        except Exception:
+            turn.status = TurnStatus.FAILED
+            turn.stop_reason = "failed"
+            self.store.create_or_update_turn_state(snapshot.session_id, turn)
+            self.store.save(snapshot)
+            raise
+        finally:
+            self._clear_turn_registration(session_id, turn.turn_id)
 
     def _refresh_catalog_for_model(self, composite_model: str) -> None:
         agent_id, _, _ = composite_model.partition("::")
@@ -432,10 +464,32 @@ class Orchestrator:
 
     def cancel(self, session_id: str, agent_id: str | None = None) -> SessionSnapshot:
         snapshot = self._require_session(session_id)
+        turn = snapshot.active_turn()
+        active_task_ids: set[str] | None = None
+        if turn is not None:
+            turn.status = TurnStatus.CANCELLING
+            turn.stop_reason = "cancel_requested"
+            self.store.create_or_update_turn_state(snapshot.session_id, turn)
+            active_task_ids = {
+                task.task_id
+                for task in snapshot.task_states
+                if task.parent_turn_id == turn.turn_id and task.status not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
+            }
+            self._set_turn_cancelled(session_id, turn.turn_id)
         self.connector_manager.cancel_session(snapshot, agent_id=agent_id)
-        snapshot.metadata["cancelled"] = True
-        self.store.save(snapshot)
-        return snapshot
+        self.store.cancel_permission_requests(
+            snapshot.session_id,
+            owner_task_ids=active_task_ids,
+            metadata={"cancel_reason": "session_cancel"},
+        )
+        self.store.mark_terminal_mappings_cancelled(
+            snapshot.session_id,
+            owner_task_ids=active_task_ids,
+            owner_agent_id=agent_id,
+            metadata={"cleanup_reason": "session_cancel"},
+        )
+        self.store.update_session_metadata(snapshot.session_id, {"cancelled": True})
+        return self._require_session(session_id)
 
     def _generate_plan(
         self,
@@ -462,13 +516,22 @@ class Orchestrator:
             agent=coordinator_agent,
         )
         raw_output = planning_result.raw_output or planning_result.summary
-        parsed_plan = parse_coordinator_plan(raw_output, coordinator_agent_id=coordinator_agent.agent_id)
-        if not parsed_plan.is_valid:
-            fallback_plan = synthesize_local_fallback_plan(user_prompt, coordinator_agent_id=coordinator_agent.agent_id)
-            fallback_plan.normalized_plan["_meta"]["coordinator_errors"] = list(parsed_plan.errors)
-            plan_parse_result = fallback_plan
+        validation_errors: list[str] = []
+        if planning_result.status == TaskStatus.CANCELLED:
+            plan_parse_result = PlanParseResult(
+                tasks=[],
+                normalized_plan={"tasks": [], "_meta": {"source": "cancelled", "coordinator_agent_id": coordinator_agent.agent_id}},
+                errors=[],
+            )
         else:
-            plan_parse_result = parsed_plan
+            parsed_plan = parse_coordinator_plan(raw_output, coordinator_agent_id=coordinator_agent.agent_id)
+            validation_errors = list(parsed_plan.errors)
+            if not parsed_plan.is_valid:
+                fallback_plan = synthesize_local_fallback_plan(user_prompt, coordinator_agent_id=coordinator_agent.agent_id)
+                fallback_plan.normalized_plan["_meta"]["coordinator_errors"] = list(parsed_plan.errors)
+                plan_parse_result = fallback_plan
+            else:
+                plan_parse_result = parsed_plan
 
         planner_record = {
             "raw_coordinator_output": raw_output,
@@ -479,13 +542,13 @@ class Orchestrator:
                 "summary": planning_result.summary,
                 "metadata": dict(planning_result.metadata),
             },
-            "validation_errors": list(parsed_plan.errors),
+            "validation_errors": validation_errors,
         }
         snapshot.metadata["planning"] = planner_record
         turn.metadata["planning"] = {
             "source": plan_parse_result.normalized_plan.get("_meta", {}).get("source"),
             "planner_task_id": planning_task.task_id,
-            "validation_errors": list(parsed_plan.errors),
+            "validation_errors": validation_errors,
         }
         self.store.create_or_update_turn_state(snapshot.session_id, turn)
         self.store.save(snapshot)
@@ -501,6 +564,7 @@ class Orchestrator:
         tasks: list[PlanTask],
         turn: OrchestrationTurnState,
         emit_update: SessionUpdateCallback | None,
+        cancel_event: threading.Event,
     ) -> list[ToolEvent]:
         coordinator_prompt = self._coordinator_instruction(user_prompt)
         runner = ExecutionGraphRunner(
@@ -539,6 +603,8 @@ class Orchestrator:
             create_finished_event=lambda task, status, content: self.normalizer.delegate_finished_event(task, status=status, content=content),
             persist_trace=self.store.persist_trace_metadata,
             save_downstream_mapping=self.store.save_downstream_session_mapping,
+            is_cancel_requested=cancel_event.is_set,
+            cancel_active_work=lambda: self.connector_manager.cancel_session(snapshot),
         )
         return runner.run()
 
@@ -619,9 +685,30 @@ class Orchestrator:
             return
         emit_update(update)
 
-    def _final_summary(self, tasks: list[PlanTask]) -> str:
+    def _final_summary(self, tasks: list[PlanTask], *, cancelled: bool = False) -> str:
+        if cancelled:
+            return "Turn cancelled."
         completed = [task for task in tasks if task.status == TaskStatus.COMPLETED]
         return f"Completed {len(completed)}/{len(tasks)} orchestrated tasks."
+
+    def _register_turn(self, session_id: str, turn_id: str) -> threading.Event:
+        with self._turn_control_lock:
+            event = threading.Event()
+            self._turn_cancel_events[(session_id, turn_id)] = event
+            self._active_turn_by_session[session_id] = turn_id
+            return event
+
+    def _clear_turn_registration(self, session_id: str, turn_id: str) -> None:
+        with self._turn_control_lock:
+            self._turn_cancel_events.pop((session_id, turn_id), None)
+            if self._active_turn_by_session.get(session_id) == turn_id:
+                self._active_turn_by_session.pop(session_id, None)
+
+    def _set_turn_cancelled(self, session_id: str, turn_id: str) -> None:
+        with self._turn_control_lock:
+            event = self._turn_cancel_events.get((session_id, turn_id))
+        if event is not None:
+            event.set()
 
     def _require_session(self, session_id: str) -> SessionSnapshot:
         snapshot = self.store.load(session_id)

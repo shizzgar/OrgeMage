@@ -9,6 +9,7 @@ from orgemage.models import (
     TaskStatus,
     TerminalMapping,
     TraceCorrelationState,
+    TurnStatus,
 )
 from orgemage.state import SQLiteSessionStore
 
@@ -18,7 +19,7 @@ def test_sqlite_session_store_round_trip_with_runtime_state(tmp_path: Path) -> N
     snapshot = SessionSnapshot(session_id="s1", cwd="/tmp/project", selected_model="codex::gpt-5-codex")
     snapshot.metadata = {"traceparent": "abc"}
     snapshot.set_downstream_session_mapping("codex", "downstream-1", metadata={"source": "test"})
-    snapshot.turns.append(OrchestrationTurnState(turn_id="turn-1", status="completed", stop_reason="end_turn"))
+    snapshot.turns.append(OrchestrationTurnState(turn_id="turn-1", status=TurnStatus.COMPLETED, stop_reason="end_turn"))
     snapshot.task_states.append(
         TaskExecutionState(
             task_id="t1",
@@ -102,7 +103,7 @@ def test_store_incremental_runtime_methods_and_legacy_migration(tmp_path: Path) 
     assert migrated.task_states[0].task_id == "legacy-task"
     assert migrated.trace_metadata[0].trace_key == "root"
 
-    turn = store.create_or_update_turn_state("legacy", OrchestrationTurnState(turn_id="turn-2", status="running"))
+    turn = store.create_or_update_turn_state("legacy", OrchestrationTurnState(turn_id="turn-2", status=TurnStatus.RUNNING))
     task = store.persist_task_update(
         "legacy",
         TaskExecutionState(
@@ -148,3 +149,59 @@ def test_store_incremental_runtime_methods_and_legacy_migration(tmp_path: Path) 
     assert any(current.upstream_terminal_id == terminal.upstream_terminal_id for current in reloaded.terminal_mappings)
     assert any(current.trace_key == trace.trace_key for current in reloaded.trace_metadata)
     assert reloaded.downstream_session_map()[mapping.agent_id] == mapping.downstream_session_id
+
+
+def test_store_can_cancel_outstanding_permissions_and_terminals(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path / "orgemage.db")
+    snapshot = SessionSnapshot(session_id="cancelled", cwd="/tmp/project")
+    store.save(snapshot)
+
+    store.persist_permission_event(
+        "cancelled",
+        PermissionRequestState(
+            request_id="perm-requested",
+            owner_task_id="task-1",
+            status="requested",
+            payload={"scope": "terminal"},
+        ),
+    )
+    store.persist_permission_event(
+        "cancelled",
+        PermissionRequestState(
+            request_id="perm-decided",
+            owner_task_id="task-2",
+            status="decided",
+            decision="allow",
+            payload={"scope": "filesystem"},
+        ),
+    )
+    store.persist_terminal_event(
+        "cancelled",
+        TerminalMapping(
+            upstream_terminal_id="up-active",
+            downstream_terminal_id="down-active",
+            owner_task_id="task-1",
+            owner_agent_id="codex",
+            status="active",
+        ),
+    )
+
+    cancelled_permissions = store.cancel_permission_requests(
+        "cancelled",
+        owner_task_ids={"task-1"},
+        metadata={"cancel_reason": "test"},
+    )
+    cancelled_terminals = store.mark_terminal_mappings_cancelled(
+        "cancelled",
+        owner_task_ids={"task-1"},
+        metadata={"cleanup_reason": "test"},
+    )
+
+    loaded = store.load("cancelled")
+    assert loaded is not None
+    assert cancelled_permissions[0].status == "cancelled"
+    assert cancelled_permissions[0].decision == "cancelled"
+    assert loaded.permission_requests[0].metadata["cancel_reason"] == "test"
+    assert loaded.permission_requests[1].status == "decided"
+    assert cancelled_terminals[0].status == "cancelled"
+    assert loaded.terminal_mappings[0].metadata["cleanup_reason"] == "test"

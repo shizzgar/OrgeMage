@@ -109,14 +109,11 @@ class AcpAgentRuntime:
             )
         finally:
             self._prompt_tasks.pop(session_id, None)
-        return self._build_prompt_response(result["summary"])
+        return self._build_prompt_response(result["summary"], stop_reason=str(result.get("stop_reason") or "end_turn"))
 
     async def cancel(self, session_id: str, **kwargs: Any) -> Any:
         agent_id = kwargs.get("agent_id")
         self.orchestrator.cancel(session_id, agent_id=agent_id)
-        task = self._prompt_tasks.get(session_id)
-        if task is not None:
-            task.cancel()
         await self._send_session_update(
             session_id,
             {
@@ -145,9 +142,9 @@ class AcpAgentRuntime:
             },
         )
 
-    def _build_prompt_response(self, summary: str) -> Any:
+    def _build_prompt_response(self, summary: str, *, stop_reason: str) -> Any:
         return self.acp.PromptResponse(
-            stop_reason="end_turn",
+            stop_reason=stop_reason,
             message=self.acp.Message(content=[self.acp.TextBlock(text=summary)]),
         )
 

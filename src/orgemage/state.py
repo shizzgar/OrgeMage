@@ -15,6 +15,7 @@ from .models import (
     TaskStatus,
     TerminalMapping,
     TraceCorrelationState,
+    TurnStatus,
 )
 
 
@@ -292,6 +293,114 @@ class SQLiteSessionStore:
             self._touch_session(conn, session_id, turn.updated_at)
         return turn
 
+    def update_session_metadata(self, session_id: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT metadata_json FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown session: {session_id}")
+            merged = {
+                **_loads_dict(row["metadata_json"]),
+                **dict(metadata),
+            }
+            timestamp = time.time()
+            conn.execute(
+                "UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE session_id = ?",
+                (json.dumps(merged), timestamp, session_id),
+            )
+        return merged
+
+    def cancel_permission_requests(
+        self,
+        session_id: str,
+        *,
+        owner_task_ids: set[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[PermissionRequestState]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT request_id, owner_task_id, status, decision, requested_at, decided_at, payload_json, metadata_json
+                FROM permission_requests
+                WHERE session_id = ?
+                ORDER BY requested_at ASC, request_id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            cancelled: list[PermissionRequestState] = []
+            now = time.time()
+            for row in rows:
+                owner_task_id = row["owner_task_id"]
+                if owner_task_ids is not None and owner_task_id not in owner_task_ids:
+                    continue
+                if row["status"] != "requested":
+                    continue
+                request = PermissionRequestState(
+                    request_id=row["request_id"],
+                    owner_task_id=owner_task_id,
+                    status="cancelled",
+                    decision="cancelled",
+                    requested_at=row["requested_at"],
+                    decided_at=now,
+                    payload=_loads_dict(row["payload_json"]),
+                    metadata={
+                        **_loads_dict(row["metadata_json"]),
+                        **dict(metadata or {}),
+                    },
+                )
+                self._persist_permission_request(conn, session_id, request)
+                cancelled.append(request)
+            if cancelled:
+                self._touch_session(conn, session_id, now)
+        return cancelled
+
+    def mark_terminal_mappings_cancelled(
+        self,
+        session_id: str,
+        *,
+        owner_task_ids: set[str] | None = None,
+        owner_agent_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> list[TerminalMapping]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT upstream_terminal_id, downstream_terminal_id, owner_task_id, owner_agent_id,
+                       refcount, status, metadata_json, created_at, updated_at
+                FROM terminal_mappings
+                WHERE session_id = ?
+                ORDER BY created_at ASC, upstream_terminal_id ASC, downstream_terminal_id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+            updated: list[TerminalMapping] = []
+            now = time.time()
+            for row in rows:
+                if owner_task_ids is not None and row["owner_task_id"] not in owner_task_ids:
+                    continue
+                if owner_agent_id is not None and row["owner_agent_id"] != owner_agent_id:
+                    continue
+                if row["status"] in {"released", "completed", "cancelled"}:
+                    continue
+                mapping = TerminalMapping(
+                    upstream_terminal_id=row["upstream_terminal_id"],
+                    downstream_terminal_id=row["downstream_terminal_id"],
+                    owner_task_id=row["owner_task_id"],
+                    owner_agent_id=row["owner_agent_id"],
+                    refcount=row["refcount"],
+                    status="cancelled",
+                    metadata={
+                        **_loads_dict(row["metadata_json"]),
+                        **dict(metadata or {}),
+                    },
+                    created_at=row["created_at"],
+                    updated_at=now,
+                )
+                self._persist_terminal_mapping(conn, session_id, mapping)
+                updated.append(mapping)
+            if updated:
+                self._touch_session(conn, session_id, now)
+        return updated
+
     def persist_task_update(self, session_id: str, task_state: TaskExecutionState) -> TaskExecutionState:
         task_state.updated_at = time.time()
         with self._connect() as conn:
@@ -491,7 +600,7 @@ class SQLiteSessionStore:
         return [
             OrchestrationTurnState(
                 turn_id=row["turn_id"],
-                status=row["status"],
+                status=_load_turn_status(row["status"]),
                 stop_reason=row["stop_reason"],
                 started_at=row["started_at"],
                 updated_at=row["updated_at"],
@@ -666,7 +775,7 @@ class SQLiteSessionStore:
             (
                 session_id,
                 turn.turn_id,
-                turn.status,
+                turn.status.value if isinstance(turn.status, TurnStatus) else str(turn.status),
                 turn.stop_reason,
                 turn.started_at,
                 turn.updated_at,
@@ -860,3 +969,18 @@ def _loads_list(payload: str | None) -> list[Any]:
     if isinstance(loaded, list):
         return loaded
     return [loaded]
+
+
+def _load_turn_status(payload: str) -> TurnStatus:
+    try:
+        return TurnStatus(payload)
+    except ValueError:
+        if payload == "running":
+            return TurnStatus.RUNNING
+        if payload == "completed":
+            return TurnStatus.COMPLETED
+        if payload == "failed":
+            return TurnStatus.FAILED
+        if payload == "cancelled":
+            return TurnStatus.CANCELLED
+        return TurnStatus.PENDING

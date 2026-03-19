@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 
 from orgemage.models import AgentCapabilities, DownstreamAgentConfig, ModelOption
 from orgemage.orchestrator import Orchestrator
@@ -386,3 +387,127 @@ def test_orchestrator_applies_fail_fast_and_continue_failure_policies(tmp_path: 
     states = {task.title: task for task in session_snapshot.task_states}
     assert states["Blocked dependent"].plan_metadata["status_reason"] in {"fail_fast", "dependency_failure"}
     assert states["Blocked dependent"].dependency_state == "blocked"
+
+
+def test_orchestrator_marks_active_turn_and_tasks_cancelled_on_session_cancel(tmp_path: Path) -> None:
+    import json
+    import threading
+
+    from orgemage.acp.downstream_client import DownstreamPromptResult
+    from orgemage.acp.manager import DownstreamConnectorManager
+    from orgemage.models import TaskStatus
+
+    planning_started = threading.Event()
+    worker_entered = threading.Event()
+    worker_release = threading.Event()
+    worker_started_titles: list[str] = []
+
+    class _CancelableConnector:
+        def __init__(self, agent: DownstreamAgentConfig) -> None:
+            self.agent = agent
+            self.negotiated_state = None
+            self.cancelled: list[str] = []
+
+        def discover_catalog(self, *, force: bool = False) -> dict[str, object]:
+            del force
+            return {
+                "agent_id": self.agent.agent_id,
+                "config_options": [],
+                "capabilities": {},
+                "command_advertisements": [],
+            }
+
+        def mark_catalog_refresh_required(self) -> None:
+            return None
+
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+            if task._meta.get("phase") == "planning":
+                planning_started.set()
+                return DownstreamPromptResult(
+                    downstream_session_id="cancel-session",
+                    status=TaskStatus.COMPLETED,
+                    summary="Generated structured orchestration plan.",
+                    raw_output=json.dumps(
+                        {
+                            "tasks": [
+                                {
+                                    "title": "Long task",
+                                    "details": "Runs until cancelled.",
+                                    "dependencies": [],
+                                    "required_capabilities": {"needsTerminal": True},
+                                    "assignee_hints": ["codex"],
+                                    "acceptable_models": [],
+                                    "priority": 90,
+                                    "_meta": {},
+                                },
+                                {
+                                    "title": "Blocked after cancel",
+                                    "details": "Must never start.",
+                                    "dependencies": ["Long task"],
+                                    "required_capabilities": {"needsFilesystem": True},
+                                    "assignee_hints": ["qwen"],
+                                    "acceptable_models": [],
+                                    "priority": 80,
+                                    "_meta": {},
+                                },
+                            ],
+                            "_meta": {"planner": "test"},
+                        }
+                    ),
+                )
+            worker_started_titles.append(task.title)
+            worker_entered.set()
+            worker_release.wait(timeout=5)
+            return DownstreamPromptResult(
+                downstream_session_id=f"cancel-{self.agent.agent_id}",
+                status=TaskStatus.CANCELLED,
+                summary="Task cancelled.",
+                response={"stop_reason": "cancelled"},
+            )
+
+        def cancel(self, downstream_session_id: str) -> None:
+            self.cancelled.append(downstream_session_id)
+            worker_release.set()
+
+    created: list[_CancelableConnector] = []
+
+    def factory(agent: DownstreamAgentConfig) -> _CancelableConnector:
+        connector = _CancelableConnector(agent)
+        created.append(connector)
+        return connector
+
+    store = SQLiteSessionStore(tmp_path / "state.db")
+    manager = DownstreamConnectorManager(_agents(), connector_factory=factory, store=store)
+    orchestrator = Orchestrator(_agents(), store, connector_manager=manager)
+    session = orchestrator.create_session(tmp_path.as_posix(), "codex::gpt-5-codex")
+    result_holder: dict[str, object] = {}
+
+    thread = threading.Thread(
+        target=lambda: result_holder.setdefault("result", orchestrator.orchestrate_turn(session.session_id, "Cancel after launch.")),
+        daemon=True,
+    )
+    thread.start()
+    assert planning_started.wait(timeout=5)
+    assert worker_entered.wait(timeout=5)
+
+    orchestrator.cancel(session.session_id)
+    thread.join(timeout=5)
+
+    assert thread.is_alive() is False
+    result = result_holder["result"]
+    assert result["stop_reason"] == "cancelled"
+    assert result["summary"] == "Turn cancelled."
+    plan_by_title = {task["title"]: task for task in result["plan"]}
+    assert plan_by_title["Long task"]["status"] == "cancelled"
+    assert plan_by_title["Blocked after cancel"]["status"] == "cancelled"
+    assert worker_started_titles == ["Long task"]
+    snapshot = orchestrator.load_session(session.session_id)
+    assert snapshot.turns[-1].status.value == "cancelled"
+    assert snapshot.turns[-1].stop_reason == "cancelled"
+    states = {task.title: task for task in snapshot.task_states}
+    assert states["Long task"].status.value == "cancelled"
+    assert states["Long task"].plan_metadata["status_reason"] == "turn_cancelled"
+    assert states["Blocked after cancel"].status.value == "cancelled"
+    assert states["Blocked after cancel"].plan_metadata["status_reason"] == "turn_cancelled"
+    assert any(connector.cancelled for connector in created)
