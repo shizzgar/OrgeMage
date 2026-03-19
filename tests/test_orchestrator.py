@@ -89,8 +89,8 @@ class _StreamingConnector:
     def mark_catalog_refresh_required(self) -> None:
         return None
 
-    def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
-        del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+    def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model):
+        del orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model
         from orgemage.acp.downstream_client import DownstreamPromptResult
         from orgemage.models import TaskStatus
 
@@ -179,8 +179,8 @@ def test_orchestrator_runs_ready_tasks_in_parallel_and_unblocks_dependencies(tmp
         def mark_catalog_refresh_required(self) -> None:
             return None
 
-        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
-            del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model
             if task._meta.get("phase") == "planning":
                 return DownstreamPromptResult(
                     downstream_session_id="parallel-session",
@@ -302,8 +302,8 @@ def test_orchestrator_applies_fail_fast_and_continue_failure_policies(tmp_path: 
         def mark_catalog_refresh_required(self) -> None:
             return None
 
-        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
-            del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model
             if task._meta.get("phase") == "planning":
                 return DownstreamPromptResult(
                     downstream_session_id="policy-session",
@@ -420,8 +420,8 @@ def test_orchestrator_marks_active_turn_and_tasks_cancelled_on_session_cancel(tm
         def mark_catalog_refresh_required(self) -> None:
             return None
 
-        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
-            del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model
             if task._meta.get("phase") == "planning":
                 planning_started.set()
                 return DownstreamPromptResult(
@@ -543,5 +543,4 @@ def test_orchestrator_propagates_prompt_metadata_into_plan_and_tool_updates(tmp_
     assert tool_update["toolCall"]["_meta"]["traceparent"] == "00-abc-123-01"
     assert tool_update["toolCall"]["_meta"]["assignee"]["agentId"]
     assert result["session"]["metadata"]["session_summary"].startswith("Completed")
-
 

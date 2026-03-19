@@ -138,6 +138,13 @@ class _FakeConnection:
         self.state.setdefault("cancel_calls", []).append(session_id)
 
 
+class _FakeConfigIdConnection(_FakeConnection):
+    async def set_config_option(self, config_id: str, session_id: str, value: str):
+        self.state.setdefault("set_config_option_calls", []).append(
+            {"session_id": session_id, "config_id": config_id, "value": value}
+        )
+
+
 class _FakeSpawnContext:
     def __init__(self, client: _FakeClient, state: dict[str, object], command: str, args: tuple[str, ...]) -> None:
         self._client = client
@@ -147,7 +154,8 @@ class _FakeSpawnContext:
 
     async def __aenter__(self):
         self._state.setdefault("spawn_calls", []).append({"command": self._command, "args": list(self._args)})
-        connection = _FakeConnection(self._client, self._state)
+        connection_type = self._state.get("connection_type", _FakeConnection)
+        connection = connection_type(self._client, self._state)
         self._state["connection"] = connection
         return connection, object()
 
@@ -228,6 +236,7 @@ def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_canc
         orchestrator_session_id="orch-1",
         downstream_session_id=None,
         cwd="/tmp/project",
+        mcp_servers=[],
         task=task,
         coordinator_prompt="Plan this work",
         selected_model="codex::gpt-5-codex",
@@ -236,6 +245,7 @@ def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_canc
         orchestrator_session_id="orch-1",
         downstream_session_id=first.downstream_session_id,
         cwd="/tmp/project",
+        mcp_servers=[],
         task=task,
         coordinator_prompt="Plan this work",
         selected_model="codex::gpt-5-codex",
@@ -353,6 +363,7 @@ def test_acp_downstream_connector_callback_layer_persists_permissions_filesystem
         orchestrator_session_id="orch-1",
         downstream_session_id=None,
         cwd=tmp_path.as_posix(),
+        mcp_servers=[],
         task=task,
         coordinator_prompt="Plan this work",
         selected_model="codex::gpt-5-codex",
@@ -417,6 +428,7 @@ def test_acp_downstream_connector_maps_callback_policy_failures_to_acp_errors(tm
         orchestrator_session_id="orch-1",
         downstream_session_id=None,
         cwd=tmp_path.as_posix(),
+        mcp_servers=[],
         task=task,
         coordinator_prompt="Plan this work",
         selected_model="codex::gpt-5-codex",
@@ -516,6 +528,7 @@ def test_acp_downstream_connector_emits_structured_debug_logging(tmp_path, monke
         orchestrator_session_id="orch-1",
         downstream_session_id=None,
         cwd=tmp_path.as_posix(),
+        mcp_servers=[],
         task=task,
         coordinator_prompt="Plan this work",
         selected_model="codex::gpt-5-codex",
@@ -528,3 +541,78 @@ def test_acp_downstream_connector_emits_structured_debug_logging(tmp_path, monke
     assert any("connector.lifecycle.execute.complete" in message for message in events)
     assert any("connector.lifecycle.cancel" in message for message in events)
     assert state["cancel_calls"] == ["downstream-session"]
+
+
+def test_acp_downstream_connector_passes_mcp_servers_through_new_and_load(monkeypatch) -> None:
+    state = _install_fake_acp(monkeypatch)
+    agent = DownstreamAgentConfig(
+        agent_id="codex",
+        name="Codex",
+        command="codex",
+        args=["--acp"],
+        models=[ModelOption(value="gpt-5-codex", name="GPT-5 Codex")],
+        default_model="gpt-5-codex",
+        runtime="acp",
+    )
+    connector = AcpDownstreamConnector(agent)
+    task = PlanTask(title="Implement", details="Details", assignee="codex")
+    mcp_servers = [
+        {"name": "filesystem", "transport": {"type": "stdio", "command": "npx", "args": ["@modelcontextprotocol/server-filesystem"]}}
+    ]
+
+    connector.discover_catalog()
+    first = connector.execute_task(
+        orchestrator_session_id="orch-1",
+        downstream_session_id=None,
+        cwd="/tmp/project",
+        mcp_servers=mcp_servers,
+        task=task,
+        coordinator_prompt="Plan this work",
+        selected_model="codex::gpt-5-codex",
+    )
+    connector.execute_task(
+        orchestrator_session_id="orch-1",
+        downstream_session_id=first.downstream_session_id,
+        cwd="/tmp/project",
+        mcp_servers=mcp_servers,
+        task=task,
+        coordinator_prompt="Plan this work",
+        selected_model="codex::gpt-5-codex",
+    )
+    connector.close()
+
+    assert state["new_session_calls"][1]["mcp_servers"] == mcp_servers
+    assert state["load_session_calls"][0]["mcp_servers"] == mcp_servers
+    assert state["load_session_calls"][1]["mcp_servers"] == mcp_servers
+
+
+def test_acp_downstream_connector_supports_sdk_config_id_signature(monkeypatch) -> None:
+    state = _install_fake_acp(monkeypatch)
+    state["connection_type"] = _FakeConfigIdConnection
+    agent = DownstreamAgentConfig(
+        agent_id="qwen",
+        name="Qwen Code",
+        command="qwen",
+        args=["--acp"],
+        models=[ModelOption(value="qwen3-coder-plus", name="Qwen3 Coder Plus")],
+        default_model="qwen3-coder-plus",
+        runtime="acp",
+    )
+    connector = AcpDownstreamConnector(agent)
+    task = PlanTask(title="Answer", details="Say who you are", assignee="qwen")
+
+    connector.discover_catalog()
+    connector.execute_task(
+        orchestrator_session_id="orch-1",
+        downstream_session_id=None,
+        cwd="/tmp/project",
+        mcp_servers=[],
+        task=task,
+        coordinator_prompt="Respond to the user.",
+        selected_model="qwen::qwen3-coder-plus",
+    )
+    connector.close()
+
+    assert state["set_config_option_calls"] == [
+        {"session_id": "downstream-session", "config_id": "model", "value": "qwen3-coder-plus"}
+    ]

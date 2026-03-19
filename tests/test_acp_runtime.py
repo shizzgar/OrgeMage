@@ -321,12 +321,13 @@ def test_acp_runtime_supports_session_loading_prompt_updates_and_cancel(tmp_path
         initialize = await runtime.initialize(7, client_connection=connection)
         assert initialize.protocol_version == 7
 
-        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex")
+        mcp_servers = [{"name": "filesystem", "transport": {"type": "stdio", "command": "fs-mcp"}}]
+        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex", mcpServers=mcp_servers)
         assert created.session_id.startswith("orch-")
         assert created.config_options[0].id == "model"
 
         await runtime.set_config_option(created.session_id, "model", "qwen::qwen3-coder-plus")
-        loaded = await runtime.load_session(tmp_path.as_posix(), created.session_id)
+        loaded = await runtime.load_session(tmp_path.as_posix(), created.session_id, mcp_servers=mcp_servers)
         assert loaded.session_id == created.session_id
 
         listed = await runtime.list_sessions()
@@ -351,6 +352,7 @@ def test_acp_runtime_supports_session_loading_prompt_updates_and_cancel(tmp_path
     assert "cancelled" in kinds
     assert kinds[-1] == "session_info"
     assert orchestrator.load_session(connection.updates[0][0]).metadata["cancelled"] is True
+    assert orchestrator.load_session(connection.updates[0][0]).mcp_servers == [{"name": "filesystem", "transport": {"type": "stdio", "command": "fs-mcp"}}]
 
 
 
@@ -387,6 +389,40 @@ def test_acp_runtime_new_and_load_session_return_before_startup_update_delivery(
         connection.release.set()
         loaded_connection.release.set()
         await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_acp_runtime_new_session_uses_bootstrap_models_without_refreshing_downstreams(tmp_path: Path) -> None:
+    class _ExplodingConnector:
+        def __init__(self, agent: DownstreamAgentConfig) -> None:
+            self.agent = agent
+            self.negotiated_state = None
+
+        def discover_catalog(self, *, force: bool = False) -> dict[str, object]:
+            del force
+            raise AssertionError("session/new should not refresh downstream catalog")
+
+        def mark_catalog_refresh_required(self) -> None:
+            return None
+
+        def execute_task(self, **kwargs):  # pragma: no cover - not used here
+            raise AssertionError("execute_task should not be called")
+
+        def cancel(self, downstream_session_id: str) -> None:
+            del downstream_session_id
+            return None
+
+    agents = _agents()
+    store = SQLiteSessionStore(tmp_path / "state.db")
+    manager = DownstreamConnectorManager(agents, connector_factory=_ExplodingConnector, store=store)
+    orchestrator = Orchestrator(agents, store, connector_manager=manager)
+    runtime = AcpAgentRuntime(acp=_FakeAcp, orchestrator=orchestrator)
+
+    async def scenario() -> None:
+        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex")
+        assert created.session_id.startswith("orch-")
+        assert created.config_options[0].options[0].value == "codex::gpt-5-codex"
 
     asyncio.run(scenario())
 
@@ -461,8 +497,8 @@ def test_acp_runtime_prompt_returns_cancelled_stop_reason_for_active_turn(tmp_pa
         def mark_catalog_refresh_required(self) -> None:
             return None
 
-        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model):
-            del orchestrator_session_id, downstream_session_id, cwd, coordinator_prompt, selected_model
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model
             if task._meta.get("phase") == "planning":
                 planning_started.set()
                 release_planning.wait(timeout=5)

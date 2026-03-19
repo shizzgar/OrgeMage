@@ -19,6 +19,7 @@ def test_sqlite_session_store_round_trip_with_runtime_state(tmp_path: Path) -> N
     store = SQLiteSessionStore(tmp_path / "orgemage.db")
     snapshot = SessionSnapshot(session_id="s1", cwd="/tmp/project", selected_model="codex::gpt-5-codex")
     snapshot.metadata = {"traceparent": "abc"}
+    snapshot.set_mcp_servers([{"name": "filesystem", "transport": {"type": "stdio", "command": "fs-mcp"}}])
     snapshot.set_downstream_session_mapping("codex", "downstream-1", metadata={"source": "test"})
     snapshot.turns.append(OrchestrationTurnState(turn_id="turn-1", status=TurnStatus.COMPLETED, stop_reason="end_turn"))
     snapshot.task_states.append(
@@ -62,6 +63,8 @@ def test_sqlite_session_store_round_trip_with_runtime_state(tmp_path: Path) -> N
     assert history == [SessionHistoryEntry.from_snapshot(loaded)]
     assert loaded.selected_model == "codex::gpt-5-codex"
     assert loaded.metadata["traceparent"] == "abc"
+    assert loaded.mcp_servers == [{"name": "filesystem", "transport": {"type": "stdio", "command": "fs-mcp"}}]
+    assert loaded.metadata["mcp_servers"] == [{"name": "filesystem", "transport": {"type": "stdio", "command": "fs-mcp"}}]
     assert loaded.downstream_session_map() == {"codex": "downstream-1"}
     assert loaded.turns[0].turn_id == "turn-1"
     assert loaded.task_graph == [{

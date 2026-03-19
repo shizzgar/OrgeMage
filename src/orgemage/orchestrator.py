@@ -328,7 +328,13 @@ class Orchestrator:
         self._turn_cancel_events: dict[tuple[str, str], threading.Event] = {}
         self._active_turn_by_session: dict[str, str] = {}
 
-    def create_session(self, cwd: str, selected_model: str | None = None) -> SessionSnapshot:
+    def create_session(
+        self,
+        cwd: str,
+        selected_model: str | None = None,
+        *,
+        mcp_servers: list[dict[str, Any]] | list[Any] | None = None,
+    ) -> SessionSnapshot:
         normalized_cwd = str(Path(cwd).resolve())
         snapshot = SessionSnapshot(
             session_id=f"orch-{uuid.uuid4().hex[:12]}",
@@ -336,6 +342,7 @@ class Orchestrator:
             selected_model=selected_model,
             title=f"OrgeMage: {Path(normalized_cwd).name or normalized_cwd}",
         )
+        snapshot.set_mcp_servers(mcp_servers)
         if selected_model:
             self._refresh_catalog_for_model(selected_model)
             resolved = self.catalog.resolve(selected_model)
@@ -343,8 +350,9 @@ class Orchestrator:
         self.store.save(snapshot)
         return snapshot
 
-    def list_model_options(self) -> list[dict[str, object]]:
-        self.connector_manager.refresh_catalog(self.catalog)
+    def list_model_options(self, *, refresh: bool = True) -> list[dict[str, object]]:
+        if refresh:
+            self.connector_manager.refresh_catalog(self.catalog)
         return self.catalog.northbound_model_options()
 
     def list_sessions(self) -> list[SessionHistoryEntry]:
@@ -367,6 +375,7 @@ class Orchestrator:
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
             "task_count": len(snapshot.task_states),
+            "mcp_servers": list(snapshot.mcp_servers),
             "history": SessionHistoryEntry.from_snapshot(snapshot).to_dict(),
         }
 
@@ -379,8 +388,17 @@ class Orchestrator:
         self.store.save(snapshot)
         return snapshot
 
-    def load_session(self, session_id: str, selected_model: str | None = None) -> SessionSnapshot:
+    def load_session(
+        self,
+        session_id: str,
+        selected_model: str | None = None,
+        *,
+        mcp_servers: list[dict[str, Any]] | list[Any] | None = None,
+    ) -> SessionSnapshot:
         snapshot = self._require_session(session_id)
+        if mcp_servers is not None:
+            snapshot.set_mcp_servers(mcp_servers)
+            self.store.save(snapshot)
         if selected_model is not None:
             return self.set_selected_model(session_id, selected_model)
         return snapshot

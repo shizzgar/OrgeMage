@@ -165,6 +165,7 @@ class SQLiteSessionStore:
             self._replace_runtime_state(conn, snapshot)
 
     def _save_session_header(self, conn: sqlite3.Connection, snapshot: SessionSnapshot) -> None:
+        snapshot.set_mcp_servers(snapshot.mcp_servers)
         conn.execute(
             """
             INSERT INTO sessions (
