@@ -272,6 +272,8 @@ orgemage --db .orgemage/runtime.db acp --stdio
 
 For startup handshakes, OrgeMage intentionally returns `session/new` and `session/load` before sending the initial `session/update`. This is the same compatibility pattern used by `codex-acp` in `src/agent/core.rs`, where post-creation updates are dispatched asynchronously so they do not race the `NewSessionResponse` delivery path.
 
+After `session/new` and `session/load`, OrgeMage also advertises a small set of northbound ACP slash commands via `available_commands_update`: `/status`, `/models`, and `/plan`. These are OrgeMage-native commands handled directly by the northbound ACP runtime rather than being silently proxied to downstream CLIs.
+
 
 ## Runtime behavior
 
