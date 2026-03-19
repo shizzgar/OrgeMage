@@ -196,6 +196,19 @@ def _install_fake_acp(monkeypatch):
     return state
 
 
+def _install_fake_acp_with_schema_capabilities(monkeypatch):
+    state = _install_fake_acp(monkeypatch)
+    module = sys.modules["acp"]
+    schema = types.SimpleNamespace(
+        ClientCapabilities=_FakeClientCapabilities,
+        Implementation=_FakeImplementation,
+    )
+    delattr(module, "ClientCapabilities")
+    delattr(module, "Implementation")
+    module.schema = schema
+    return state
+
+
 def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_cancel(monkeypatch) -> None:
     state = _install_fake_acp(monkeypatch)
     agent = DownstreamAgentConfig(
@@ -259,6 +272,26 @@ def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_canc
             "options": [{"value": "gpt-5-codex", "name": "GPT-5 Codex"}],
         }
     ]
+
+
+def test_acp_downstream_connector_supports_schema_scoped_client_capabilities(monkeypatch) -> None:
+    state = _install_fake_acp_with_schema_capabilities(monkeypatch)
+    agent = DownstreamAgentConfig(
+        agent_id="codex",
+        name="Codex",
+        command="codex",
+        args=["--acp"],
+        models=[ModelOption(value="gpt-5-codex", name="GPT-5 Codex")],
+        default_model="gpt-5-codex",
+        runtime="acp",
+    )
+    connector = AcpDownstreamConnector(agent)
+
+    catalog = connector.discover_catalog()
+    connector.close()
+
+    assert catalog["config_options"][0]["category"] == "model"
+    assert len(state["initialize_calls"]) == 1
 
 
 def test_acp_downstream_connector_callback_layer_persists_permissions_filesystem_and_terminal(tmp_path, monkeypatch) -> None:
@@ -495,4 +528,3 @@ def test_acp_downstream_connector_emits_structured_debug_logging(tmp_path, monke
     assert any("connector.lifecycle.execute.complete" in message for message in events)
     assert any("connector.lifecycle.cancel" in message for message in events)
     assert state["cancel_calls"] == ["downstream-session"]
-

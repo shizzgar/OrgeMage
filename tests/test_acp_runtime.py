@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 from orgemage.adapters.acp_sdk import AcpAgentRuntime
 from orgemage.acp.downstream_client import DownstreamPromptResult
@@ -52,6 +53,131 @@ class _FakeAcp:
         def __init__(self, stop_reason: str, message: object) -> None:
             self.stop_reason = stop_reason
             self.message = message
+
+
+class _FakeModernAcp:
+    class Agent:
+        pass
+
+    class SessionListCapabilities:
+        def __init__(self) -> None:
+            pass
+
+    class SessionResumeCapabilities:
+        def __init__(self) -> None:
+            pass
+
+    class SessionCapabilities:
+        def __init__(self, list=None, resume=None, **kwargs) -> None:
+            self.list = list
+            self.resume = resume
+            self.extra = kwargs
+
+    class McpCapabilities:
+        def __init__(self, **kwargs) -> None:
+            self.extra = kwargs
+
+    class PromptCapabilities:
+        def __init__(self, **kwargs) -> None:
+            self.extra = kwargs
+
+    class AgentCapabilities:
+        def __init__(self, loadSession: bool, sessionCapabilities=None, mcpCapabilities=None, promptCapabilities=None, **kwargs) -> None:
+            self.loadSession = loadSession
+            self.sessionCapabilities = sessionCapabilities
+            self.mcpCapabilities = mcpCapabilities
+            self.promptCapabilities = promptCapabilities
+            self.extra = kwargs
+
+    class Implementation:
+        def __init__(self, name: str, title: str | None = None, version: str = "") -> None:
+            self.name = name
+            self.title = title
+            self.version = version
+
+    class InitializeResponse:
+        def __init__(self, protocolVersion: int, agentCapabilities=None, agentInfo=None, **kwargs) -> None:
+            self.protocol_version = protocolVersion
+            self.agent_capabilities = agentCapabilities
+            self.agent_info = agentInfo
+            self.extra = kwargs
+
+    class SessionConfigOption:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class ModelInfo:
+        def __init__(self, id: str, name: str, description: str | None = None) -> None:
+            self.id = id
+            self.name = name
+            self.description = description
+
+    class SessionModelState:
+        def __init__(self, currentModelId: str, availableModels: list[object], **kwargs) -> None:
+            self.current_model_id = currentModelId
+            self.available_models = availableModels
+            self.extra = kwargs
+
+    class NewSessionResponse:
+        def __init__(self, sessionId: str, configOptions: list[object] | None = None, models=None, **kwargs) -> None:
+            self.session_id = sessionId
+            self.config_options = configOptions or []
+            self.models = models
+            self.extra = kwargs
+
+    class LoadSessionResponse:
+        def __init__(self, configOptions: list[object] | None = None, models=None, **kwargs) -> None:
+            self.config_options = configOptions or []
+            self.models = models
+            self.extra = kwargs
+
+    class SessionInfo:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class ListSessionsResponse:
+        def __init__(self, sessions: list[object]) -> None:
+            self.sessions = sessions
+
+    class SessionInfoUpdate:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class AgentPlanUpdate:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class ToolCallStart:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class ToolCallProgress:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class AgentMessageChunk:
+        @classmethod
+        def model_validate(cls, payload: dict[str, object]) -> object:
+            return SimpleNamespace(**payload)
+
+    class SetSessionConfigOptionResponse:
+        def __init__(self, config_options: list[object]) -> None:
+            self.config_options = config_options
+
+    class SetSessionModelResponse:
+        def __init__(self) -> None:
+            pass
+
+    class PromptResponse:
+        def __init__(self, stopReason: str, **kwargs) -> None:
+            self.stop_reason = stopReason
+            self.extra = kwargs
 
 
 class _RecordingConnection:
@@ -254,3 +380,45 @@ def test_acp_runtime_includes_session_summary_in_history_and_session_info(tmp_pa
     assert session_info_updates[-1]["info"]["summary"].startswith("Completed")
     assert session_info_updates[-1]["info"]["history"]["summary"].startswith("Completed")
 
+
+def test_acp_runtime_supports_modern_acp_schema_shapes(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    runtime = AcpAgentRuntime(acp=_FakeModernAcp, orchestrator=orchestrator)
+    connection = _RecordingConnection()
+
+    async def scenario() -> None:
+        initialize = await runtime.initialize(1, conn=connection)
+        assert initialize.protocol_version == 1
+        assert initialize.agent_capabilities.loadSession is True
+        assert initialize.agent_info.name == "orgemage"
+
+        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex")
+        assert created.session_id.startswith("orch-")
+        assert created.config_options[0].currentValue == "codex::gpt-5-codex"
+        assert created.models.current_model_id == "codex::gpt-5-codex"
+
+        await runtime.set_session_model(created.session_id, "qwen::qwen3-coder-plus")
+        config_response = await runtime.set_config_option(created.session_id, "model", "codex::gpt-5-codex")
+        assert config_response.config_options[0].currentValue == "codex::gpt-5-codex"
+
+        loaded = await runtime.load_session(tmp_path.as_posix(), created.session_id)
+        assert loaded.models.current_model_id == "codex::gpt-5-codex"
+
+        listed = await runtime.list_sessions()
+        assert listed.sessions[0].sessionId == created.session_id
+
+        prompt_response = await runtime.prompt(
+            created.session_id,
+            [_FakeAcp.TextBlock("Inspect the repository and implement updates.")],
+        )
+        assert prompt_response.stop_reason == "end_turn"
+
+        await runtime.cancel(created.session_id)
+
+    asyncio.run(scenario())
+
+    kinds = [getattr(update, "sessionUpdate", None) for _, update in connection.updates]
+    assert "session_info_update" in kinds
+    assert "plan" in kinds
+    assert "tool_call" in kinds
+    assert "agent_message_chunk" in kinds
