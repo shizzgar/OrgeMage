@@ -9,7 +9,9 @@ from typing import Any, Callable
 
 from .acp.manager import DownstreamConnectorManager
 from .catalog import FederatedModelCatalog
+from .debug import debug_event, get_logger
 from .execution_graph import ExecutionGraphRunner
+from .metadata import build_turn_metadata, event_metadata, propagate_task_metadata, session_title, summarize_session
 from .models import (
     DownstreamAgentConfig,
     OrchestrationTurnState,
@@ -28,6 +30,7 @@ from .scheduler import Scheduler
 from .state import SQLiteSessionStore
 
 SessionUpdateCallback = Callable[[dict[str, Any]], None]
+_LOG = get_logger(__name__)
 
 
 class OrchestrationEventNormalizer:
@@ -43,6 +46,10 @@ class OrchestrationEventNormalizer:
             "plan": [task.to_dict() for task in tasks],
             "globalPlan": [task.to_acp_plan_item() for task in tasks],
             "planning": dict(snapshot.metadata.get("planning", {})),
+            "_meta": {
+                **dict(snapshot.metadata.get("turn_context", {})),
+                "planningProvenance": dict(snapshot.metadata.get("planning", {}).get("normalized_plan", {}).get("_meta", {})),
+            },
         }
 
     def tool_call_update(
@@ -59,6 +66,7 @@ class OrchestrationEventNormalizer:
             "tool_call": event.to_dict(),
             "toolCall": event.to_acp_tool_call(),
             "globalPlan": [plan_task.to_acp_plan_item() for plan_task in self._current_plan(snapshot)],
+            "_meta": dict(event.metadata),
         }
         if include_task:
             payload["task"] = task.to_dict()
@@ -73,6 +81,7 @@ class OrchestrationEventNormalizer:
         updates: Iterable[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []
+        turn_id = str(task._meta.get("turnId") or snapshot.metadata.get("turn_context", {}).get("turnId") or "")
         for index, update in enumerate(updates):
             tool_call_id = self._resolve_tool_call_id(task, update, index=index)
             locations = self._extract_locations(update)
@@ -83,7 +92,7 @@ class OrchestrationEventNormalizer:
                     downstream_terminal_id=str(terminal.get("downstreamTerminalId") or terminal["terminalId"]),
                     owner_task_id=task.task_id,
                     owner_agent_id=agent.agent_id,
-                    metadata={"source_update": update},
+                    metadata={"source_update": update, "workerCorrelationId": task._meta.get("workerCorrelationId")},
                 )
                 self.store.persist_terminal_event(snapshot.session_id, mapping)
                 snapshot.terminal_mappings = [
@@ -106,12 +115,20 @@ class OrchestrationEventNormalizer:
                 content=content,
                 locations=locations,
                 terminal=terminal,
-                metadata={
-                    "taskId": task.task_id,
-                    "source": "downstream_session_update",
-                    "workerAgentId": agent.agent_id,
-                    "rawUpdate": update,
-                },
+                metadata=event_metadata(
+                    session_id=snapshot.session_id,
+                    turn_id=turn_id,
+                    task_id=task.task_id,
+                    task_meta=task._meta,
+                    assignee=agent.agent_id,
+                    source="downstream_session_update",
+                    extra={
+                        "taskId": task.task_id,
+                        "workerAgentId": agent.agent_id,
+                        "rawUpdate": update,
+                        "toolCallId": tool_call_id,
+                    },
+                ),
             )
             normalized.append(self.tool_call_update(snapshot, task, event))
         return normalized
@@ -135,26 +152,48 @@ class OrchestrationEventNormalizer:
                 "content": blocks,
             },
             "result": result,
+            "_meta": {
+                **dict(snapshot.metadata.get("turn_context", {})),
+                "sessionSummary": snapshot.metadata.get("session_summary", summary),
+            },
         }
 
-    def delegate_started_event(self, task: PlanTask) -> ToolEvent:
+    def delegate_started_event(self, snapshot: SessionSnapshot, task: PlanTask) -> ToolEvent:
+        turn_id = str(task._meta.get("turnId") or snapshot.metadata.get("turn_context", {}).get("turnId") or "")
         return ToolEvent(
             tool_call_id=self._orchestrator_tool_id(task),
             title=task.title,
             kind="delegate",
             status=TaskStatus.IN_PROGRESS,
             content=f"Delegating to {task.assignee}.",
-            metadata={"taskId": task.task_id, "source": "orchestrator"},
+            metadata=event_metadata(
+                session_id=snapshot.session_id,
+                turn_id=turn_id,
+                task_id=task.task_id,
+                task_meta=task._meta,
+                assignee=task.assignee,
+                source="orchestrator",
+                extra={"taskId": task.task_id},
+            ),
         )
 
-    def delegate_finished_event(self, task: PlanTask, *, status: TaskStatus, content: str) -> ToolEvent:
+    def delegate_finished_event(self, snapshot: SessionSnapshot, task: PlanTask, *, status: TaskStatus, content: str) -> ToolEvent:
+        turn_id = str(task._meta.get("turnId") or snapshot.metadata.get("turn_context", {}).get("turnId") or "")
         return ToolEvent(
             tool_call_id=self._orchestrator_tool_id(task),
             title=task.title,
             kind="delegate",
             status=status,
             content=content,
-            metadata={"taskId": task.task_id, "source": "orchestrator"},
+            metadata=event_metadata(
+                session_id=snapshot.session_id,
+                turn_id=turn_id,
+                task_id=task.task_id,
+                task_meta=task._meta,
+                assignee=task.assignee,
+                source="orchestrator",
+                extra={"taskId": task.task_id},
+            ),
         )
 
     def _current_plan(self, snapshot: SessionSnapshot) -> list[PlanTask]:
@@ -309,7 +348,7 @@ class Orchestrator:
         return self.catalog.northbound_model_options()
 
     def list_sessions(self) -> list[SessionHistoryEntry]:
-        return [SessionHistoryEntry.from_snapshot(snapshot) for snapshot in self.store.list_sessions()]
+        return self.store.list_session_history()
 
     def session_info(self, session_id: str) -> dict[str, Any]:
         snapshot = self._require_session(session_id)
@@ -317,6 +356,7 @@ class Orchestrator:
         return {
             "session_id": snapshot.session_id,
             "title": snapshot.title,
+            "summary": snapshot.metadata.get("session_summary", ""),
             "cwd": snapshot.cwd,
             "selected_model": snapshot.selected_model,
             "coordinator_agent_id": snapshot.coordinator_agent_id,
@@ -327,6 +367,7 @@ class Orchestrator:
             "created_at": snapshot.created_at,
             "updated_at": snapshot.updated_at,
             "task_count": len(snapshot.task_states),
+            "history": SessionHistoryEntry.from_snapshot(snapshot).to_dict(),
         }
 
     def set_selected_model(self, session_id: str, composite_model: str) -> SessionSnapshot:
@@ -350,8 +391,9 @@ class Orchestrator:
         user_prompt: str,
         *,
         emit_update: SessionUpdateCallback | None = None,
+        prompt_metadata: dict[str, Any] | None = None,
     ) -> None:
-        self._execute_turn(session_id, user_prompt, emit_update=emit_update)
+        self._execute_turn(session_id, user_prompt, emit_update=emit_update, prompt_metadata=prompt_metadata)
 
     def orchestrate_turn(
         self,
@@ -359,6 +401,7 @@ class Orchestrator:
         user_prompt: str,
         *,
         emit_update: SessionUpdateCallback | None = None,
+        prompt_metadata: dict[str, Any] | None = None,
     ) -> dict[str, object]:
         updates: list[dict[str, Any]] = []
 
@@ -367,7 +410,7 @@ class Orchestrator:
             if emit_update is not None:
                 emit_update(update)
 
-        result = self._execute_turn(session_id, user_prompt, emit_update=collector)
+        result = self._execute_turn(session_id, user_prompt, emit_update=collector, prompt_metadata=prompt_metadata)
         result["updates"] = updates
         return result
 
@@ -377,6 +420,7 @@ class Orchestrator:
         user_prompt: str,
         *,
         emit_update: SessionUpdateCallback | None,
+        prompt_metadata: dict[str, Any] | None,
     ) -> dict[str, object]:
         snapshot = self._require_session(session_id)
         if not snapshot.selected_model:
@@ -386,8 +430,20 @@ class Orchestrator:
         resolved = self.catalog.resolve(snapshot.selected_model or "")
 
         turn = OrchestrationTurnState(status=TurnStatus.RUNNING, turn_id=f"turn-{uuid.uuid4().hex[:12]}")
+        history_fields = summarize_session(user_prompt)
+        turn.metadata["prompt"] = {"summary": history_fields["summary"]}
+        turn.metadata["_meta"] = build_turn_metadata(
+            session_id=snapshot.session_id,
+            turn_id=turn.turn_id,
+            prompt_metadata=prompt_metadata,
+        )
+        snapshot.metadata["turn_context"] = dict(turn.metadata["_meta"])
+        snapshot.metadata.setdefault("prompt_metadata", {}).update(dict(prompt_metadata or {}))
+        snapshot.metadata["session_summary"] = history_fields["summary"]
+        snapshot.title = session_title(snapshot.title, history_fields["title"])
         snapshot.turns.append(turn)
         self.store.create_or_update_turn_state(snapshot.session_id, turn)
+        self.store.save(snapshot)
         cancel_event = self._register_turn(session_id, turn.turn_id)
 
         try:
@@ -401,10 +457,11 @@ class Orchestrator:
             if planner_record["planner_result"]["status"] == TaskStatus.CANCELLED.value:
                 cancel_event.set()
             if cancel_event.is_set():
-                plan: list[PlanTask] = []
-                tool_events: list[ToolEvent] = []
+                plan = []
+                tool_events = []
             else:
                 plan = self.scheduler.assign_tasks(plan_parse_result.tasks, self.catalog.agents, resolved.agent.agent_id)
+                self._apply_task_metadata(snapshot=snapshot, turn=turn, tasks=plan, planner_record=planner_record)
                 snapshot.task_states = [TaskExecutionState.from_plan_task(task, parent_turn_id=turn.turn_id) for task in plan]
                 for task_state in snapshot.task_states:
                     self.store.persist_task_update(snapshot.session_id, task_state)
@@ -428,9 +485,10 @@ class Orchestrator:
                 turn.status = TurnStatus.COMPLETED
                 turn.stop_reason = "end_turn"
             self.store.create_or_update_turn_state(snapshot.session_id, turn)
+            summary = self._final_summary(plan, cancelled=cancel_event.is_set())
+            self._update_session_history(snapshot, user_prompt=user_prompt, final_summary=summary)
             self.store.save(snapshot)
             snapshot = self._require_session(session_id)
-            summary = self._final_summary(plan, cancelled=cancel_event.is_set())
             result = {
                 "session": snapshot.to_dict(),
                 "coordinator": {
@@ -452,6 +510,7 @@ class Orchestrator:
             turn.status = TurnStatus.FAILED
             turn.stop_reason = "failed"
             self.store.create_or_update_turn_state(snapshot.session_id, turn)
+            self._update_session_history(snapshot, user_prompt=user_prompt, final_summary="Turn failed.")
             self.store.save(snapshot)
             raise
         finally:
@@ -476,6 +535,14 @@ class Orchestrator:
                 if task.parent_turn_id == turn.turn_id and task.status not in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
             }
             self._set_turn_cancelled(session_id, turn.turn_id)
+        debug_event(
+            _LOG,
+            "orchestrator.cancel",
+            session_id=session_id,
+            agent_id=agent_id,
+            turn_id=turn.turn_id if turn is not None else None,
+            active_task_ids=sorted(active_task_ids or []),
+        )
         self.connector_manager.cancel_session(snapshot, agent_id=agent_id)
         self.store.cancel_permission_requests(
             snapshot.session_id,
@@ -488,7 +555,7 @@ class Orchestrator:
             owner_agent_id=agent_id,
             metadata={"cleanup_reason": "session_cancel"},
         )
-        self.store.update_session_metadata(snapshot.session_id, {"cancelled": True})
+        self.store.update_session_metadata(snapshot.session_id, {"cancelled": True, "session_summary": "Turn cancelled."})
         return self._require_session(session_id)
 
     def _generate_plan(
@@ -506,7 +573,24 @@ class Orchestrator:
             required_capabilities={"planner": True, "needsPermissions": True},
             assignee=coordinator_agent.agent_id,
             priority=100,
-            _meta={"source": "coordinator", "phase": "planning"},
+            _meta=propagate_task_metadata(
+                {"source": "coordinator", "phase": "planning", "execution_role": "coordinator"},
+                session_id=snapshot.session_id,
+                turn_id=turn.turn_id,
+                task_id=f"planning:{turn.turn_id}",
+                assignee=coordinator_agent.agent_id,
+                assignee_hints=[coordinator_agent.agent_id],
+                planning_provenance={},
+                prompt_metadata=dict(snapshot.metadata.get("turn_context", {})),
+            ),
+        )
+        debug_event(
+            _LOG,
+            "planning.generate.start",
+            session_id=snapshot.session_id,
+            turn_id=turn.turn_id,
+            coordinator_agent_id=coordinator_agent.agent_id,
+            selected_model=selected_model,
         )
         planning_result = self.connector_manager.execute_task(
             session=snapshot,
@@ -544,12 +628,26 @@ class Orchestrator:
             },
             "validation_errors": validation_errors,
         }
+        debug_event(
+            _LOG,
+            "planning.generate.complete",
+            session_id=snapshot.session_id,
+            turn_id=turn.turn_id,
+            planner_status=planning_result.status.value,
+            validation_errors=validation_errors,
+            normalized_plan_meta=plan_parse_result.normalized_plan.get("_meta", {}),
+        )
         snapshot.metadata["planning"] = planner_record
         turn.metadata["planning"] = {
             "source": plan_parse_result.normalized_plan.get("_meta", {}).get("source"),
             "planner_task_id": planning_task.task_id,
             "validation_errors": validation_errors,
         }
+        turn.metadata["_meta"] = {
+            **dict(turn.metadata.get("_meta", {})),
+            "planningProvenance": dict(plan_parse_result.normalized_plan.get("_meta", {})),
+        }
+        snapshot.metadata["turn_context"] = dict(turn.metadata["_meta"])
         self.store.create_or_update_turn_state(snapshot.session_id, turn)
         self.store.save(snapshot)
         return plan_parse_result, planner_record
@@ -599,8 +697,8 @@ class Orchestrator:
             emit_plan_update=lambda: self._emit_update(self.normalizer.plan_update(snapshot, tasks), emit_update),
             emit_generic_update=lambda update: self._emit_update(update, emit_update),
             emit_tool_event=lambda task, event: self._emit_update(self.normalizer.tool_call_update(snapshot, task, event), emit_update),
-            create_started_event=self.normalizer.delegate_started_event,
-            create_finished_event=lambda task, status, content: self.normalizer.delegate_finished_event(task, status=status, content=content),
+            create_started_event=lambda task: self.normalizer.delegate_started_event(snapshot, task),
+            create_finished_event=lambda task, status, content: self.normalizer.delegate_finished_event(snapshot, task, status=status, content=content),
             persist_trace=self.store.persist_trace_metadata,
             save_downstream_mapping=self.store.save_downstream_session_mapping,
             is_cancel_requested=cancel_event.is_set,
@@ -608,6 +706,27 @@ class Orchestrator:
         )
         return runner.run()
 
+    def _apply_task_metadata(
+        self,
+        *,
+        snapshot: SessionSnapshot,
+        turn: OrchestrationTurnState,
+        tasks: list[PlanTask],
+        planner_record: dict[str, Any],
+    ) -> None:
+        planning_provenance = dict(planner_record.get("normalized_plan", {}).get("_meta", {}))
+        prompt_metadata = dict(snapshot.metadata.get("turn_context", {}))
+        for task in tasks:
+            task._meta = propagate_task_metadata(
+                task._meta,
+                session_id=snapshot.session_id,
+                turn_id=turn.turn_id,
+                task_id=task.task_id,
+                assignee=task.assignee,
+                assignee_hints=task.assignee_hints,
+                planning_provenance=planning_provenance,
+                prompt_metadata=prompt_metadata,
+            )
 
     def _persist_task_state(
         self,
@@ -640,6 +759,11 @@ class Orchestrator:
         self.store.persist_task_update(snapshot.session_id, task_state)
         snapshot.upsert_task_state(task_state)
         return task_state
+
+    def _update_session_history(self, snapshot: SessionSnapshot, *, user_prompt: str, final_summary: str) -> None:
+        fields = summarize_session(user_prompt, final_summary)
+        snapshot.title = session_title(snapshot.title, fields["title"])
+        snapshot.metadata["session_summary"] = fields["summary"]
 
     def _coordinator_instruction(self, user_prompt: str) -> str:
         return textwrap.dedent(

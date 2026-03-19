@@ -459,3 +459,40 @@ def test_orchestrator_cancel_propagates_to_connector_manager(tmp_path, monkeypat
 
     assert len(created) == 1
     assert created[0].cancelled == ["downstream-session"]
+
+
+def test_acp_downstream_connector_emits_structured_debug_logging(tmp_path, monkeypatch, caplog) -> None:
+    import logging
+
+    state = _install_fake_acp(monkeypatch)
+    agent = DownstreamAgentConfig(
+        agent_id="codex",
+        name="Codex",
+        command="codex",
+        args=["--acp"],
+        models=[ModelOption(value="gpt-5-codex", name="GPT-5 Codex")],
+        default_model="gpt-5-codex",
+        runtime="acp",
+    )
+    connector = AcpDownstreamConnector(agent)
+    task = PlanTask(title="Implement", details="Details", assignee="codex", _meta={"turnId": "turn-1", "traceId": "trace-log"})
+
+    caplog.set_level(logging.DEBUG)
+    connector.discover_catalog()
+    connector.execute_task(
+        orchestrator_session_id="orch-1",
+        downstream_session_id=None,
+        cwd=tmp_path.as_posix(),
+        task=task,
+        coordinator_prompt="Plan this work",
+        selected_model="codex::gpt-5-codex",
+    )
+    connector.cancel("downstream-session")
+    connector.close()
+
+    events = [record.message for record in caplog.records if record.name == "orgemage.acp.downstream_client"]
+    assert any("connector.lifecycle.start" in message for message in events)
+    assert any("connector.lifecycle.execute.complete" in message for message in events)
+    assert any("connector.lifecycle.cancel" in message for message in events)
+    assert state["cancel_calls"] == ["downstream-session"]
+

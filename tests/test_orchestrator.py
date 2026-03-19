@@ -511,3 +511,37 @@ def test_orchestrator_marks_active_turn_and_tasks_cancelled_on_session_cancel(tm
     assert states["Blocked after cancel"].status.value == "cancelled"
     assert states["Blocked after cancel"].plan_metadata["status_reason"] == "turn_cancelled"
     assert any(connector.cancelled for connector in created)
+
+
+def test_orchestrator_propagates_prompt_metadata_into_plan_and_tool_updates(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    session = orchestrator.create_session(tmp_path.as_posix(), "codex::gpt-5-codex")
+    updates: list[dict[str, object]] = []
+
+    result = orchestrator.orchestrate_turn(
+        session.session_id,
+        "Investigate session metadata propagation.",
+        emit_update=updates.append,
+        prompt_metadata={
+            "traceId": "trace-123",
+            "traceparent": "00-abc-123-01",
+            "policyAnnotations": {"mode": "safe"},
+        },
+    )
+
+    plan_update = next(update for update in updates if update["sessionUpdate"] == "plan")
+    first_plan_item = plan_update["globalPlan"][0]
+    assert first_plan_item["_meta"]["traceId"] == "trace-123"
+    assert first_plan_item["_meta"]["traceparent"] == "00-abc-123-01"
+    assert first_plan_item["_meta"]["turnId"].startswith("turn-")
+    assert "workerCorrelationId" in first_plan_item["_meta"]
+    assert "planningProvenance" in first_plan_item["_meta"]
+    assert first_plan_item["_meta"]["policyAnnotations"]["mode"] == "safe"
+
+    tool_update = next(update for update in updates if update["sessionUpdate"] == "tool_call")
+    assert tool_update["toolCall"]["_meta"]["traceId"] == "trace-123"
+    assert tool_update["toolCall"]["_meta"]["traceparent"] == "00-abc-123-01"
+    assert tool_update["toolCall"]["_meta"]["assignee"]["agentId"]
+    assert result["session"]["metadata"]["session_summary"].startswith("Completed")
+
+

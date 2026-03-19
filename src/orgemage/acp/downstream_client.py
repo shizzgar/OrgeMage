@@ -13,6 +13,7 @@ import time
 from typing import Any, Callable, Protocol
 import uuid
 
+from ..debug import debug_event, get_logger
 from ..models import (
     DownstreamAgentConfig,
     DownstreamNegotiatedState,
@@ -23,6 +24,8 @@ from ..models import (
     TraceCorrelationState,
 )
 from ..state import SQLiteSessionStore
+
+_LOG = get_logger(__name__)
 
 
 class DownstreamConnectorError(RuntimeError):
@@ -83,6 +86,8 @@ class _ExecutionContext:
     downstream_session_id: str
     cwd: str
     task: PlanTask
+    turn_id: str | None = None
+    prompt_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class _BufferedTerminalProcess:
@@ -166,6 +171,7 @@ class _DownstreamCallbackLayer:
     def bind_execution(self, context: _ExecutionContext) -> None:
         with self._lock:
             self._contexts[context.downstream_session_id] = context
+        debug_event(_LOG, "connector.callback.bind_execution", downstream_session_id=context.downstream_session_id, orchestrator_session_id=context.orchestrator_session_id, task_id=context.task.task_id, turn_id=context.turn_id)
 
     def cleanup_session(self, downstream_session_id: str, *, reason: str) -> None:
         with self._lock:
@@ -177,6 +183,7 @@ class _DownstreamCallbackLayer:
             ]
         if context is None:
             return
+        debug_event(_LOG, "connector.callback.cleanup", downstream_session_id=downstream_session_id, task_id=context.task.task_id, reason=reason)
         for terminal_id in terminal_ids:
             self._release_terminal(context, terminal_id=terminal_id, reason=reason, allow_missing=True)
 
@@ -187,6 +194,7 @@ class _DownstreamCallbackLayer:
             pending_permission_ids = list(self._pending_permissions.get(downstream_session_id, set()))
         if context is None:
             return
+        debug_event(_LOG, "connector.callback.cancel", downstream_session_id=downstream_session_id, task_id=context.task.task_id, reason=reason, pending_permissions=pending_permission_ids)
         for request_id in pending_permission_ids:
             self._persist_permission(
                 context,
@@ -216,7 +224,7 @@ class _DownstreamCallbackLayer:
             owner_task_id=context.task.task_id,
             status="requested",
             payload=payload,
-            metadata={"agent_id": self.agent.agent_id, "decision_source": "pending"},
+            metadata={"agent_id": self.agent.agent_id, "decision_source": "pending", "turnId": context.turn_id, "promptMetadata": dict(context.prompt_metadata)},
         )
         self._persist_permission(context, request_state)
         with self._lock:
@@ -242,6 +250,7 @@ class _DownstreamCallbackLayer:
                     "response": _to_plain_data(response),
                 }
                 self._persist_permission(context, request_state)
+                debug_event(_LOG, "connector.permission.decision", agent_id=self.agent.agent_id, task_id=context.task.task_id, request_id=request_id, decision=decision, source="upstream")
                 return response
             decision = self._headless_policy("session/request_permission", payload)
             if self._is_cancelled(context.downstream_session_id):
@@ -257,6 +266,7 @@ class _DownstreamCallbackLayer:
                 "decision": decision,
             }
             self._persist_permission(context, request_state)
+            debug_event(_LOG, "connector.permission.decision", agent_id=self.agent.agent_id, task_id=context.task.task_id, request_id=request_id, decision=decision, source=request_state.metadata.get("decision_source"))
             return {"request_id": request_id, "decision": decision}
         finally:
             with self._lock:
@@ -584,6 +594,8 @@ class _DownstreamCallbackLayer:
                 task_id=context.task.task_id,
                 metadata={
                     "agent_id": self.agent.agent_id,
+                    "turnId": context.turn_id,
+                    "promptMetadata": dict(context.prompt_metadata),
                     **metadata,
                 },
             ),
@@ -641,8 +653,9 @@ class _SessionUpdateCollector:
             self._updates[session_id] = []
 
     def append(self, session_id: str, update: Any) -> None:
+        payload = _to_plain_data(update)
         with self._lock:
-            self._updates[session_id].append(_to_plain_data(update))
+            self._updates[session_id].append(payload)
 
     def get(self, session_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -730,6 +743,7 @@ class AcpDownstreamConnector:
                 self._loop_thread.run(self._start_async())
 
     async def _start_async(self) -> None:
+        debug_event(_LOG, "connector.lifecycle.start", agent_id=self.agent.agent_id, command=self.agent.command, args=self.agent.args)
         sdk = _load_sdk()
         self._sdk = sdk
         self._callback_layer = _DownstreamCallbackLayer(
@@ -763,8 +777,10 @@ class AcpDownstreamConnector:
             protocol_version=payload.get("protocol_version") or payload.get("protocolVersion"),
         )
         await self._refresh_catalog_async(force=True)
+        debug_event(_LOG, "connector.lifecycle.started", agent_id=self.agent.agent_id, negotiated_state=self.negotiated_state.to_dict() if self.negotiated_state is not None else None)
 
     async def _close_async(self) -> None:
+        debug_event(_LOG, "connector.lifecycle.close", agent_id=self.agent.agent_id)
         if self._callback_layer is not None:
             for session_id in list(self._callback_layer._contexts.keys()):
                 self._callback_layer.cleanup_session(session_id, reason="connector_close")
@@ -778,6 +794,7 @@ class AcpDownstreamConnector:
         self._catalog_refresh_required = True
 
     async def _cancel_async(self, downstream_session_id: str) -> None:
+        debug_event(_LOG, "connector.lifecycle.cancel", agent_id=self.agent.agent_id, downstream_session_id=downstream_session_id)
         if self._conn is None:
             return
         try:
@@ -789,6 +806,7 @@ class AcpDownstreamConnector:
     async def _discover_catalog_async(self, *, force: bool = False) -> dict[str, Any]:
         if self._conn is None:
             raise DownstreamConnectorError(f"Downstream agent '{self.agent.agent_id}' is not connected")
+        debug_event(_LOG, "connector.lifecycle.discover_catalog", agent_id=self.agent.agent_id, force=force)
         if not force and self._catalog_state is not None and not self._catalog_refresh_required:
             return dict(self._catalog_state)
         return await self._refresh_catalog_async(force=force)
@@ -806,6 +824,7 @@ class AcpDownstreamConnector:
         if self._conn is None or self._sdk is None:
             raise DownstreamConnectorError(f"Downstream agent '{self.agent.agent_id}' is not connected")
 
+        debug_event(_LOG, "connector.lifecycle.execute.start", agent_id=self.agent.agent_id, orchestrator_session_id=orchestrator_session_id, task_id=task.task_id, downstream_session_id=downstream_session_id)
         session_id, session_payload = await self._ensure_session_async(cwd, downstream_session_id)
         self._record_session_state(session_id, session_payload)
         await self._apply_model_selection_async(session_id, selected_model, cwd=cwd)
@@ -816,6 +835,8 @@ class AcpDownstreamConnector:
                     downstream_session_id=session_id,
                     cwd=cwd,
                     task=task,
+                    turn_id=str(task._meta.get("turnId")) if task._meta.get("turnId") is not None else None,
+                    prompt_metadata=dict(task._meta),
                 )
             )
 
@@ -837,7 +858,7 @@ class AcpDownstreamConnector:
             if not summary:
                 summary = f"Downstream agent {self.agent.name} completed {task.title!r}."
             stop_reason = _extract_stop_reason(_to_plain_data(response))
-            return DownstreamPromptResult(
+            result = DownstreamPromptResult(
                 downstream_session_id=session_id,
                 status=TaskStatus.CANCELLED if stop_reason == "cancelled" else TaskStatus.COMPLETED,
                 summary=summary,
@@ -845,6 +866,8 @@ class AcpDownstreamConnector:
                 updates=updates,
                 response=_to_plain_data(response),
             )
+            debug_event(_LOG, "connector.lifecycle.execute.complete", agent_id=self.agent.agent_id, task_id=task.task_id, downstream_session_id=session_id, status=result.status.value, update_count=len(updates))
+            return result
         except Exception:
             cleanup_reason = "failure"
             raise
@@ -954,6 +977,7 @@ class AcpDownstreamConnector:
     ) -> str:
         return (
             f"OrgeMage orchestrator session: {orchestrator_session_id}\n"
+            f"Delegation metadata: {task._meta}\n"
             f"Target downstream agent: {self.agent.agent_id}\n"
             f"Selected coordinator model: {selected_model}\n\n"
             f"Coordinator directive:\n{coordinator_prompt}\n\n"

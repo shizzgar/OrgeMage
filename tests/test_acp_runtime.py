@@ -150,7 +150,8 @@ def test_acp_runtime_supports_session_loading_prompt_updates_and_cancel(tmp_path
     assert "plan" in kinds
     assert "tool_call" in kinds
     assert "message" in kinds
-    assert kinds[-1] == "cancelled"
+    assert "cancelled" in kinds
+    assert kinds[-1] == "session_info"
     assert orchestrator.load_session(connection.updates[0][0]).metadata["cancelled"] is True
 
 
@@ -224,3 +225,32 @@ def test_acp_runtime_prompt_returns_cancelled_stop_reason_for_active_turn(tmp_pa
     assert snapshot.turns[-1].status.value == "cancelled"
     assert snapshot.turns[-1].stop_reason == "cancelled"
     assert any(update["sessionUpdate"] == "cancelled" for _, update in connection.updates)
+
+
+def test_acp_runtime_includes_session_summary_in_history_and_session_info(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    runtime = AcpAgentRuntime(acp=_FakeAcp, orchestrator=orchestrator)
+    connection = _RecordingConnection()
+
+    class _MetaBlock(_FakeAcp.TextBlock):
+        def __init__(self, text: str, metadata: dict[str, object]) -> None:
+            super().__init__(text)
+            self.metadata = metadata
+
+    async def scenario() -> None:
+        await runtime.initialize(7, client_connection=connection)
+        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex")
+        await runtime.prompt(
+            created.session_id,
+            [_MetaBlock("Make session history UX friendly.", {"traceId": "trace-runtime", "traceparent": "tp-runtime"})],
+        )
+        listed = await runtime.list_sessions()
+        assert listed.sessions[0]["summary"].startswith("Completed")
+        assert listed.sessions[0]["title"].startswith("OrgeMage: Make session history UX friendly")
+
+    asyncio.run(scenario())
+
+    session_info_updates = [update for _, update in connection.updates if update["sessionUpdate"] == "session_info"]
+    assert session_info_updates[-1]["info"]["summary"].startswith("Completed")
+    assert session_info_updates[-1]["info"]["history"]["summary"].startswith("Completed")
+

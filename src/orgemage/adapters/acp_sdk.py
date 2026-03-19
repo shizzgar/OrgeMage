@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 from typing import Any
 
+from ..metadata import extract_prompt_metadata
 from ..orchestrator import Orchestrator
 
 
@@ -89,7 +90,7 @@ class AcpAgentRuntime:
         return None
 
     async def prompt(self, session_id: str, prompt: list[Any], **kwargs: Any) -> Any:
-        del kwargs
+        prompt_metadata = extract_prompt_metadata(prompt, **kwargs)
         text = "\n".join(getattr(block, "text", str(block)) for block in prompt)
         loop = asyncio.get_running_loop()
 
@@ -106,9 +107,11 @@ class AcpAgentRuntime:
                 session_id,
                 text,
                 emit_update=emit_update,
+                prompt_metadata=prompt_metadata,
             )
         finally:
             self._prompt_tasks.pop(session_id, None)
+        await self._send_session_info_update(session_id)
         return self._build_prompt_response(result["summary"], stop_reason=str(result.get("stop_reason") or "end_turn"))
 
     async def cancel(self, session_id: str, **kwargs: Any) -> Any:
@@ -122,6 +125,7 @@ class AcpAgentRuntime:
                 "agent_id": agent_id,
             },
         )
+        await self._send_session_info_update(session_id)
         return None
 
     async def _send_session_update(self, session_id: str, update: dict[str, Any]) -> None:

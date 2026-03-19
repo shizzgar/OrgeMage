@@ -4,6 +4,7 @@ import sqlite3
 from orgemage.models import (
     OrchestrationTurnState,
     PermissionRequestState,
+    SessionHistoryEntry,
     SessionSnapshot,
     TaskExecutionState,
     TaskStatus,
@@ -55,8 +56,10 @@ def test_sqlite_session_store_round_trip_with_runtime_state(tmp_path: Path) -> N
 
     store.save(snapshot)
     loaded = store.load("s1")
+    history = store.list_session_history()
 
     assert loaded is not None
+    assert history == [SessionHistoryEntry.from_snapshot(loaded)]
     assert loaded.selected_model == "codex::gpt-5-codex"
     assert loaded.metadata["traceparent"] == "abc"
     assert loaded.downstream_session_map() == {"codex": "downstream-1"}
