@@ -5,6 +5,7 @@ from typing import Callable
 from ..catalog import FederatedModelCatalog
 from ..downstream import MockDownstreamClient
 from ..models import DownstreamAgentConfig, SessionSnapshot, PlanTask, WorkerResult
+from ..state import SQLiteSessionStore
 from .downstream_client import AcpDownstreamConnector, DownstreamConnector, DownstreamPromptResult
 
 ConnectorFactory = Callable[[DownstreamAgentConfig], DownstreamConnector]
@@ -83,10 +84,21 @@ class DownstreamConnectorManager:
         self,
         agents: list[DownstreamAgentConfig],
         connector_factory: ConnectorFactory | None = None,
+        *,
+        store: SQLiteSessionStore | None = None,
+        headless_policy: Callable[[str, dict[str, object]], str] | None = None,
     ) -> None:
         self._agents = {agent.agent_id: agent for agent in agents}
         self._connector_factory = connector_factory or self._build_connector
         self._connectors: dict[str, DownstreamConnector] = {}
+        self._store = store
+        self._headless_policy = headless_policy
+        self._upstream_client_connection: object | None = None
+        self._upstream_capabilities: object | None = None
+
+    def bind_upstream_client_connection(self, connection: object | None, *, capabilities: object | None = None) -> None:
+        self._upstream_client_connection = connection
+        self._upstream_capabilities = capabilities
 
     def get_connector(self, agent_id: str) -> DownstreamConnector:
         connector = self._connectors.get(agent_id)
@@ -170,4 +182,10 @@ class DownstreamConnectorManager:
     def _build_connector(self, agent: DownstreamAgentConfig) -> DownstreamConnector:
         if agent.runtime == "mock":
             return _MockConnectorAdapter(agent)
-        return AcpDownstreamConnector(agent)
+        return AcpDownstreamConnector(
+            agent,
+            store=self._store,
+            upstream_client_getter=lambda: self._upstream_client_connection,
+            upstream_capabilities_getter=lambda: self._upstream_capabilities,
+            headless_policy=self._headless_policy,
+        )

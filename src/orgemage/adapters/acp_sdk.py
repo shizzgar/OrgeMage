@@ -44,14 +44,20 @@ class AcpAgentRuntime:
         self.acp = acp
         self.orchestrator = orchestrator
         self.client_connection: Any = None
+        self.client_capabilities: Any = None
         self._prompt_tasks: dict[str, asyncio.Task[Any]] = {}
         self.agent = _build_agent(acp, self)
 
     def bind_client_connection(self, connection: Any) -> None:
         self.client_connection = connection
+        self.orchestrator.connector_manager.bind_upstream_client_connection(
+            connection,
+            capabilities=getattr(self, "client_capabilities", None),
+        )
 
     async def initialize(self, protocol_version: int, **kwargs: Any) -> Any:
         client = kwargs.get("client") or kwargs.get("client_connection")
+        self.client_capabilities = kwargs.get("client_capabilities")
         if client is not None:
             self.bind_client_connection(client)
         return _build_initialize_response(self.acp, protocol_version)

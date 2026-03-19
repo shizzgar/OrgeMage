@@ -279,7 +279,7 @@ class Orchestrator:
             raise ValueError("At least one downstream agent configuration is required")
         self.catalog = FederatedModelCatalog(agents)
         self.store = store or SQLiteSessionStore()
-        self.connector_manager = connector_manager or DownstreamConnectorManager(agents)
+        self.connector_manager = connector_manager or DownstreamConnectorManager(agents, store=self.store)
         self.scheduler = Scheduler()
         self.normalizer = OrchestrationEventNormalizer(self.store)
 

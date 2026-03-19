@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 
 from orgemage.acp.downstream_client import AcpDownstreamConnector
 from orgemage.acp.manager import DownstreamConnectorManager
-from orgemage.models import DownstreamAgentConfig, ModelOption, PlanTask, SessionSnapshot, TaskStatus
+from orgemage.models import AgentCapabilities, DownstreamAgentConfig, ModelOption, PlanTask, SessionSnapshot, TaskStatus
 from orgemage.orchestrator import Orchestrator
 from orgemage.state import SQLiteSessionStore
 
@@ -19,9 +20,31 @@ class _FakePayload:
 
 
 class _FakeRequestError(Exception):
+    def __init__(self, code: str, method: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.method = method
+        self.message = message
+
     @classmethod
     def method_not_found(cls, method: str) -> "_FakeRequestError":
-        return cls(method)
+        return cls("method_not_found", method, method)
+
+    @classmethod
+    def invalid_params(cls, method: str, message: str) -> "_FakeRequestError":
+        return cls("invalid_params", method, message)
+
+    @classmethod
+    def permission_denied(cls, method: str, message: str) -> "_FakeRequestError":
+        return cls("permission_denied", method, message)
+
+    @classmethod
+    def forbidden(cls, method: str, message: str) -> "_FakeRequestError":
+        return cls("forbidden", method, message)
+
+    @classmethod
+    def internal_error(cls, method: str, message: str) -> "_FakeRequestError":
+        return cls("internal_error", method, message)
 
 
 class _FakeClient:
@@ -99,6 +122,9 @@ class _FakeConnection:
 
     async def prompt(self, session_id: str, prompt: list[object]):
         self.state.setdefault("prompt_calls", []).append({"session_id": session_id, "prompt": prompt})
+        prompt_hook = self.state.get("prompt_hook")
+        if callable(prompt_hook):
+            await prompt_hook(self.client, self.state, session_id)
         await self.client.session_update(
             session_id,
             {"message": {"content": [{"text": "stream update"}]}},
@@ -134,6 +160,26 @@ class _FakeSpawnContext:
 class _FakeTextBlock(_FakePayload):
     def __init__(self, text: str) -> None:
         self.text = text
+
+
+class _FakeUpstreamClientConnection:
+    def __init__(self) -> None:
+        self.permission_requests: list[dict[str, object]] = []
+        self.read_requests: list[str] = []
+        self.write_requests: list[dict[str, str]] = []
+
+    async def request_permission(self, **kwargs):
+        self.permission_requests.append(dict(kwargs))
+        return {"decision": "allow", "source": "upstream"}
+
+    async def read_text_file(self, *, path: str):
+        self.read_requests.append(path)
+        return {"path": path, "content": Path(path).read_text(encoding="utf-8")}
+
+    async def write_text_file(self, *, path: str, content: str):
+        self.write_requests.append({"path": path, "content": content})
+        Path(path).write_text(content, encoding="utf-8")
+        return {"path": path, "bytes_written": len(content.encode("utf-8"))}
 
 
 def _install_fake_acp(monkeypatch):
@@ -213,6 +259,145 @@ def test_acp_downstream_connector_runs_initialize_session_prompt_update_and_canc
             "options": [{"value": "gpt-5-codex", "name": "GPT-5 Codex"}],
         }
     ]
+
+
+def test_acp_downstream_connector_callback_layer_persists_permissions_filesystem_and_terminal(tmp_path, monkeypatch) -> None:
+    state = _install_fake_acp(monkeypatch)
+    test_file = tmp_path / "notes.txt"
+    upstream = _FakeUpstreamClientConnection()
+    agent = DownstreamAgentConfig(
+        agent_id="codex",
+        name="Codex",
+        command="codex",
+        args=["--acp"],
+        models=[ModelOption(value="gpt-5-codex", name="GPT-5 Codex")],
+        capabilities=AgentCapabilities(supports_terminal=True, supports_filesystem=True),
+        runtime="acp",
+    )
+    store = SQLiteSessionStore(tmp_path / "state.db")
+    store.save(SessionSnapshot(session_id="orch-1", cwd=tmp_path.as_posix()))
+
+    async def prompt_hook(client, current_state, session_id: str) -> None:
+        current_state["permission_response"] = await client.request_permission(
+            session_id=session_id,
+            request_id="perm-1",
+            tool_name="write_file",
+        )
+        current_state["write_response"] = await client.write_text_file(
+            session_id=session_id,
+            path=test_file.as_posix(),
+            content="hello from downstream\n",
+        )
+        current_state["read_response"] = await client.read_text_file(
+            session_id=session_id,
+            path=test_file.as_posix(),
+        )
+        terminal = await client.create_terminal(
+            session_id=session_id,
+            command=["python", "-c", "print('terminal-ok')"],
+        )
+        current_state["terminal"] = terminal
+        terminal_id = terminal["terminal_id"]
+        current_state["terminal_wait"] = await client.wait_for_terminal_exit(
+            session_id=session_id,
+            terminal_id=terminal_id,
+            timeout_seconds=5,
+        )
+        current_state["terminal_output"] = await client.terminal_output(
+            session_id=session_id,
+            terminal_id=terminal_id,
+        )
+
+    state["prompt_hook"] = prompt_hook
+    connector = AcpDownstreamConnector(
+        agent,
+        store=store,
+        upstream_client_getter=lambda: upstream,
+    )
+    task = PlanTask(title="Implement", details="Details", assignee="codex")
+
+    result = connector.execute_task(
+        orchestrator_session_id="orch-1",
+        downstream_session_id=None,
+        cwd=tmp_path.as_posix(),
+        task=task,
+        coordinator_prompt="Plan this work",
+        selected_model="codex::gpt-5-codex",
+    )
+    connector.close()
+
+    assert result.status is TaskStatus.COMPLETED
+    assert state["permission_response"]["decision"] == "allow"
+    assert upstream.permission_requests == [{"session_id": "downstream-session", "request_id": "perm-1", "tool_name": "write_file"}]
+    assert test_file.read_text(encoding="utf-8") == "hello from downstream\n"
+    assert state["read_response"]["content"] == "hello from downstream\n"
+    assert state["terminal_wait"]["status"] == "exited"
+    assert "terminal-ok" in state["terminal_output"]["content"]
+
+    loaded = store.load("orch-1")
+    assert loaded is not None
+    assert loaded.permission_requests[0].request_id == "perm-1"
+    assert loaded.permission_requests[0].decision == "allow"
+    assert loaded.permission_requests[0].metadata["decision_source"] == "upstream"
+    assert loaded.terminal_mappings[0].owner_task_id == task.task_id
+    assert loaded.terminal_mappings[0].owner_agent_id == "codex"
+    assert loaded.terminal_mappings[0].status == "released"
+    assert any(trace.metadata["method"] == "fs/write_text_file" for trace in loaded.trace_metadata)
+    assert any(trace.metadata["method"] == "fs/read_text_file" for trace in loaded.trace_metadata)
+
+
+def test_acp_downstream_connector_maps_callback_policy_failures_to_acp_errors(tmp_path, monkeypatch) -> None:
+    state = _install_fake_acp(monkeypatch)
+    agent = DownstreamAgentConfig(
+        agent_id="codex",
+        name="Codex",
+        command="codex",
+        args=["--acp"],
+        models=[ModelOption(value="gpt-5-codex", name="GPT-5 Codex")],
+        capabilities=AgentCapabilities(supports_terminal=True, supports_filesystem=True),
+        runtime="acp",
+    )
+    store = SQLiteSessionStore(tmp_path / "state.db")
+    store.save(SessionSnapshot(session_id="orch-1", cwd=tmp_path.as_posix()))
+
+    async def prompt_hook(client, current_state, session_id: str) -> None:
+        try:
+            await client.read_text_file(
+                session_id=session_id,
+                path=(tmp_path.parent / "outside.txt").resolve().as_posix(),
+            )
+        except _FakeRequestError as exc:
+            current_state["fs_error"] = exc
+        terminal = await client.create_terminal(session_id=session_id, command=["python", "-c", "print('x')"])
+        await client.wait_for_terminal_exit(session_id=session_id, terminal_id=terminal["terminal_id"], timeout_seconds=5)
+        await client.release_terminal(session_id=session_id, terminal_id=terminal["terminal_id"])
+        try:
+            await client.kill_terminal(session_id=session_id, terminal_id=terminal["terminal_id"])
+        except _FakeRequestError as exc:
+            current_state["terminal_error"] = exc
+
+    state["prompt_hook"] = prompt_hook
+    connector = AcpDownstreamConnector(agent, store=store)
+    task = PlanTask(title="Implement", details="Details", assignee="codex")
+
+    connector.execute_task(
+        orchestrator_session_id="orch-1",
+        downstream_session_id=None,
+        cwd=tmp_path.as_posix(),
+        task=task,
+        coordinator_prompt="Plan this work",
+        selected_model="codex::gpt-5-codex",
+    )
+    connector.close()
+
+    fs_error = state["fs_error"]
+    terminal_error = state["terminal_error"]
+    assert isinstance(fs_error, _FakeRequestError)
+    assert fs_error.code == "permission_denied"
+    assert fs_error.method == "fs/read_text_file"
+    assert isinstance(terminal_error, _FakeRequestError)
+    assert terminal_error.code == "forbidden"
+    assert terminal_error.method == "terminal/kill"
 
 
 class _CancelRecordingConnector:
