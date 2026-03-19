@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import importlib.util
+import logging
 from typing import Any
 
 from ..metadata import extract_prompt_metadata
 from ..orchestrator import Orchestrator
+
+
+_LOG = logging.getLogger(__name__)
 
 
 class AcpSdkUnavailableError(RuntimeError):
@@ -59,6 +63,7 @@ class AcpAgentRuntime:
         self.client_capabilities: Any = None
         self._prompt_tasks: dict[str, asyncio.Task[Any]] = {}
         self._tool_call_seen: dict[str, set[str]] = {}
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self.agent = _build_agent(acp, self)
 
     def bind_client_connection(self, connection: Any) -> None:
@@ -77,14 +82,16 @@ class AcpAgentRuntime:
 
     async def new_session(self, cwd: str, **kwargs: Any) -> Any:
         session = self.orchestrator.create_session(cwd, kwargs.get("model"))
-        await self._send_session_info_update(session.session_id)
-        return _build_new_session_response(self.acp, session.session_id, self.orchestrator)
+        response = _build_new_session_response(self.acp, session.session_id, self.orchestrator)
+        self._schedule_session_info_update(session.session_id)
+        return response
 
     async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> Any:
         del cwd
         snapshot = self.orchestrator.load_session(session_id, selected_model=kwargs.get("model"))
-        await self._send_session_info_update(snapshot.session_id)
-        return _build_load_session_response(self.acp, snapshot.session_id, self.orchestrator)
+        response = _build_load_session_response(self.acp, snapshot.session_id, self.orchestrator)
+        self._schedule_session_info_update(snapshot.session_id)
+        return response
 
     async def list_sessions(self, **kwargs: Any) -> Any:
         del kwargs
@@ -178,6 +185,31 @@ class AcpAgentRuntime:
                 "agent_id": agent_id,
             },
         )
+
+    def _schedule_session_info_update(self, session_id: str) -> None:
+        if self.client_connection is None:
+            return
+        loop = asyncio.get_running_loop()
+        # Mirror the codex-acp startup pattern: send post-response session updates
+        # asynchronously so they do not race the NewSessionResponse/LoadSessionResponse path.
+        loop.call_soon(self._start_session_info_update_task, session_id)
+
+    def _start_session_info_update_task(self, session_id: str) -> None:
+        self._start_background_task(self._send_session_info_update(session_id))
+
+    def _start_background_task(self, coroutine: Any) -> None:
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._finalize_background_task)
+
+    def _finalize_background_task(self, task: asyncio.Task[Any]) -> None:
+        self._background_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            _LOG.exception("Background ACP session update task failed")
 
     def _build_prompt_response(self, summary: str, *, stop_reason: str) -> Any:
         response_type = _acp_attr(self.acp, "PromptResponse")
