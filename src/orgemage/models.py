@@ -349,6 +349,7 @@ class SessionSnapshot:
     session_id: str
     cwd: str
     selected_model: str | None = None
+    current_mode_id: str | None = None
     coordinator_agent_id: str | None = None
     title: str = "OrgeMage Session"
     created_at: float = field(default_factory=time.time)
@@ -363,6 +364,14 @@ class SessionSnapshot:
     trace_metadata: list[TraceCorrelationState] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.current_mode_id:
+            self.set_current_mode(self.current_mode_id)
+        else:
+            legacy_mode = self.metadata.get("current_mode_id", self.metadata.get("currentModeId"))
+            self.current_mode_id = str(legacy_mode) if isinstance(legacy_mode, str) and legacy_mode else None
+            if self.current_mode_id is not None:
+                self.metadata["current_mode_id"] = self.current_mode_id
+                self.metadata.pop("currentModeId", None)
         if self.mcp_servers:
             self.set_mcp_servers(self.mcp_servers)
             return
@@ -478,11 +487,21 @@ class SessionSnapshot:
         self.metadata["mcp_servers"] = list(normalized)
         self.metadata.pop("mcpServers", None)
 
+    def set_current_mode(self, mode_id: str | None) -> None:
+        normalized = str(mode_id).strip() if isinstance(mode_id, str) else ""
+        self.current_mode_id = normalized or None
+        if self.current_mode_id is None:
+            self.metadata.pop("current_mode_id", None)
+        else:
+            self.metadata["current_mode_id"] = self.current_mode_id
+        self.metadata.pop("currentModeId", None)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "session_id": self.session_id,
             "cwd": self.cwd,
             "selected_model": self.selected_model,
+            "current_mode_id": self.current_mode_id,
             "coordinator_agent_id": self.coordinator_agent_id,
             "title": self.title,
             "created_at": self.created_at,

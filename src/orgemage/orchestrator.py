@@ -311,6 +311,25 @@ class OrchestrationEventNormalizer:
 
 
 class Orchestrator:
+    SESSION_MODES: tuple[dict[str, str], ...] = (
+        {
+            "id": "read-only",
+            "name": "Read Only",
+            "description": "Inspect project state without applying side effects.",
+        },
+        {
+            "id": "auto",
+            "name": "Auto",
+            "description": "Default orchestration mode with balanced autonomy.",
+        },
+        {
+            "id": "full-access",
+            "name": "Full Access",
+            "description": "Allow the orchestrator to take broad implementation actions.",
+        },
+    )
+    DEFAULT_SESSION_MODE = "auto"
+
     def __init__(
         self,
         agents: list[DownstreamAgentConfig],
@@ -340,6 +359,7 @@ class Orchestrator:
             session_id=f"orch-{uuid.uuid4().hex[:12]}",
             cwd=normalized_cwd,
             selected_model=selected_model,
+            current_mode_id=self.DEFAULT_SESSION_MODE,
             title=f"OrgeMage: {Path(normalized_cwd).name or normalized_cwd}",
         )
         snapshot.set_mcp_servers(mcp_servers)
@@ -367,6 +387,7 @@ class Orchestrator:
             "summary": snapshot.metadata.get("session_summary", ""),
             "cwd": snapshot.cwd,
             "selected_model": snapshot.selected_model,
+            "current_mode_id": snapshot.current_mode_id or self.DEFAULT_SESSION_MODE,
             "coordinator_agent_id": snapshot.coordinator_agent_id,
             "active_turn_id": active_turn.turn_id if active_turn is not None else None,
             "active_turn_status": (
@@ -376,8 +397,25 @@ class Orchestrator:
             "updated_at": snapshot.updated_at,
             "task_count": len(snapshot.task_states),
             "mcp_servers": list(snapshot.mcp_servers),
+            "available_modes": self.available_session_modes(),
             "history": SessionHistoryEntry.from_snapshot(snapshot).to_dict(),
         }
+
+    def available_session_modes(self) -> list[dict[str, str]]:
+        return [dict(mode) for mode in self.SESSION_MODES]
+
+    def current_session_mode(self, session_id: str) -> str:
+        snapshot = self._require_session(session_id)
+        return snapshot.current_mode_id or self.DEFAULT_SESSION_MODE
+
+    def set_session_mode(self, session_id: str, mode_id: str) -> SessionSnapshot:
+        snapshot = self._require_session(session_id)
+        allowed_mode_ids = {mode["id"] for mode in self.SESSION_MODES}
+        if mode_id not in allowed_mode_ids:
+            raise ValueError(f"Unsupported session mode: {mode_id}")
+        snapshot.set_current_mode(mode_id)
+        self.store.save(snapshot)
+        return snapshot
 
     def set_selected_model(self, session_id: str, composite_model: str) -> SessionSnapshot:
         snapshot = self._require_session(session_id)
