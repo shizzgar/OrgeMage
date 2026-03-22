@@ -1,3 +1,19 @@
+Metadata-Version: 2.4
+Name: orgemage
+Version: 0.1.0
+Summary: ACP-native multi-agent orchestrator with unified model selection
+Author: OpenAI Codex
+License: Apache-2.0
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Provides-Extra: acp
+Requires-Dist: agent-client-protocol>=0.8.0; extra == "acp"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: agent-client-protocol>=0.8.0; extra == "dev"
+Dynamic: license-file
+
 # OrgeMage
 
 OrgeMage is an ACP-native orchestrator that exposes a single upstream ACP agent while coordinating multiple downstream ACP agents behind a unified model selector.
@@ -57,7 +73,7 @@ This prints the top-level commands:
 
 By default, OrgeMage bootstraps three downstream agents:
 
-- `codex` (spawned through `codex app-server`)
+- `codex` (spawned through `codex-acp` in ACP mode)
 - `gemini`
 - `qwen`
 
@@ -69,7 +85,7 @@ orgemage models
 
 You should see composite model IDs such as:
 
-- `codex::gpt-5.4`
+- `codex::gpt-5-codex`
 - `gemini::gemini-2.5-pro`
 - `qwen::qwen3-coder-plus`
 
@@ -85,7 +101,7 @@ orgemage \
   --db .orgemage/dev.db \
   run \
   --cwd . \
-  --model codex::gpt-5.4 \
+  --model codex::gpt-5-codex \
   "Design the task, delegate implementation, and summarize the result."
 ```
 
@@ -95,27 +111,27 @@ This mode is best for:
 - debugging the orchestration flow
 - running tests locally without external agent dependencies
 
-#### Real downstream execution
+#### Real ACP downstream execution
 
-Use the real runtime when you want OrgeMage to spawn configured downstream agents such as Codex, Gemini CLI, and Qwen Code:
+Use the real ACP runtime when you want OrgeMage to spawn configured downstream ACP agents such as Codex, Gemini CLI, and Qwen Code:
 
 ```bash
 orgemage \
   --db .orgemage/runtime.db \
   run \
   --cwd . \
-  --model codex::gpt-5.4 \
+  --model codex::gpt-5-codex \
   "Implement the ACP orchestrator and validate it."
 ```
 
-Before running this mode, make sure the downstream commands referenced by your config are installed and available on `PATH`. By default, OrgeMage uses `codex app-server` for Codex and ACP-compatible entrypoints for Gemini and Qwen.
+Before running this mode, make sure the downstream commands referenced by your config are installed and available on `PATH`. For Codex, the ACP entrypoint is `codex-acp`, not the raw `codex` CLI.
 
 ### 5. Create and reuse sessions explicitly
 
 If you want session persistence across multiple invocations, point OrgeMage at a file-backed SQLite database and create a session first:
 
 ```bash
-orgemage --db .orgemage/runtime.db session --cwd . --model codex::gpt-5.4
+orgemage --db .orgemage/runtime.db session --cwd . --model codex::gpt-5-codex
 ```
 
 Then run future turns against the same database file so the stored session catalog and runtime state are preserved.
@@ -214,29 +230,19 @@ Example `orgemage-agents.json`:
 }
 ```
 
-### 8. Run a real ACP smoke test with `acpx`
-
-If `acpx` is installed and your current shell environment already has downstream auth available (for example `~/.qwen/oauth_creds.json` for Qwen Code), run:
-
-```bash
-./scripts/smoke_acpx.sh
-```
-
-This validates a real northbound ACP session, model negotiation, session reuse, a simple identity prompt, and a read-only project analysis prompt through `acpx`.
-
 ## Configuration
 
 By default the CLI bootstraps three downstream agents from the design documents:
 
-- Codex via `codex app-server`
+- Codex via `codex-acp`
 - Gemini CLI via `gemini --experimental-acp`
 - Qwen Code via `qwen --acp`
 
-You can override the default Codex app-server binary path with `ORGEMAGE_CODEX_APP_SERVER_COMMAND=/custom/path/to/codex`.
+You can override the default Codex bridge path with `ORGEMAGE_CODEX_ACP_COMMAND=/custom/path/to/codex-acp`.
 
-> Note: Codex is now integrated through `codex app-server`, which is a separate JSON-RPC runtime from ACP. Gemini and Qwen continue to use ACP downstream transports.
+> Warning: `codex-acp` and `codex` are different roles. `codex-acp` is the ACP bridge that OrgeMage can launch as a downstream ACP peer; raw `codex` is not guaranteed to expose ACP transport on stdio.
 
-`codex app-server` uses methods such as `thread/start`, `thread/resume`, and `turn/start`. It is not wire-compatible with ACP `session/new` or `session/prompt`, so OrgeMage runs it through a dedicated runtime adapter instead of the ACP connector path.
+`codex-cli 0.115.0` also exposes `codex app-server`, but that is a separate experimental app-server protocol with methods such as `thread/start` and `turn/start`. It is not wire-compatible with ACP `session/new` or `session/prompt`, so OrgeMage currently treats it as a future runtime adapter rather than an ACP downstream entrypoint.
 
 When `runtime` is `"acp"`, OrgeMage validates that the configured command looks like an ACP-compatible entrypoint. Known-good defaults are `codex-acp`, `gemini --experimental-acp`, and `qwen --acp`. For custom wrappers, set `"metadata": {"acp_entrypoint": true}` to opt in explicitly.
 
@@ -244,7 +250,6 @@ When `runtime` is `"acp"`, OrgeMage validates that the configured command looks 
 
 | Profile | Launch command | Models | Modes | FS | Permissions | MCP | Known quirks |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Codex App Server | `codex app-server` | Native `model/list`, synthesized into OrgeMage `model` config options | Synthesized sandbox modes from thread state | Yes | Yes | `stdio` | Uses a JSON-RPC thread/turn protocol rather than ACP. OrgeMage translates app-server events into ACP-like worker updates for the upstream UI. |
 | Codex ACP | `codex-acp` | Native `models.availableModels` plus `model` config option | Native `modes.availableModes` | Yes | Yes | `stdio` | Dedicated ACP bridge binary. If startup fails under a restrictive sandbox, treat that as an environment issue before assuming protocol breakage. |
 | Gemini CLI | `gemini --experimental-acp` | Native `models.availableModels`; OrgeMage synthesizes a `model` config option for catalog UX | Native `modes.availableModes` | Yes | Yes | `stdio`, `sse`, `http` | Session payloads expose models and modes but may omit `configOptions`. Slash commands are typically advertised asynchronously after session creation. |
 | Qwen Code | `qwen --acp` | Native `models.availableModels` and `model` config option | Native `modes.availableModes` and `mode` config option | Yes | Yes | `stdio` | Model IDs can be auth-scoped. Non-stdio MCP servers are not silently dropped: OrgeMage records a transport diagnostic instead. |

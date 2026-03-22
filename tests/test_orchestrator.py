@@ -1,7 +1,7 @@
 from pathlib import Path
 import threading
 
-from orgemage.models import AgentCapabilities, DownstreamAgentConfig, ModelOption
+from orgemage.models import AgentCapabilities, DownstreamAgentConfig, ModelOption, PlanTask, TaskStatus
 from orgemage.orchestrator import Orchestrator
 from orgemage.state import SQLiteSessionStore
 
@@ -58,10 +58,189 @@ def test_orchestrator_defaults_to_first_model_if_none_selected(tmp_path: Path) -
     orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
     session = orchestrator.create_session(tmp_path.as_posix())
 
+    assert session.selected_model == "codex::gpt-5-codex"
+
     result = orchestrator.orchestrate_turn(session.session_id, "Inspect the repository.")
 
     assert result["session"]["selected_model"] is not None
     assert result["coordinator"]["model"] in {"gpt-5-codex", "qwen3-coder-plus"}
+
+
+def test_orchestrator_answers_identity_prompts_locally(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    session = orchestrator.create_session(tmp_path.as_posix(), "qwen::qwen3-coder-plus")
+
+    result = orchestrator.orchestrate_turn(session.session_id, "Кто ты? Что ты можешь?")
+
+    assert result["coordinator"]["agent_id"] == "qwen"
+    assert result["planning"]["normalized_plan"]["_meta"]["source"] == "local_response"
+    assert result["plan"] == []
+    assert "Я OrgeMage" in result["summary"]
+    assert "qwen::qwen3-coder-plus" in result["summary"]
+
+
+def test_orchestrator_answers_tell_me_about_yourself_prompts_locally(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    session = orchestrator.create_session(tmp_path.as_posix(), "qwen::qwen3-coder-plus")
+
+    result = orchestrator.orchestrate_turn(session.session_id, "Расскажи о себе")
+
+    assert result["coordinator"]["agent_id"] == "qwen"
+    assert result["planning"]["normalized_plan"]["_meta"]["source"] == "local_response"
+    assert result["plan"] == []
+    assert "Я OrgeMage" in result["summary"]
+    assert "qwen::qwen3-coder-plus" in result["summary"]
+
+
+def test_orchestrator_uses_direct_response_task_output_as_final_summary(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    session = orchestrator.create_session(tmp_path.as_posix(), "qwen::qwen3-coder-plus")
+    task = PlanTask(
+        title="Respond directly to the user",
+        details="Answer briefly",
+        assignee="qwen",
+        status=TaskStatus.COMPLETED,
+        output="Я рабочий ответ от выбранной модели.",
+        _meta={"fallback_mode": "direct_response"},
+    )
+
+    summary = orchestrator._final_summary([task])
+    message = orchestrator.normalizer.message_update(
+        session,
+        summary,
+        {"summary": summary, "stop_reason": "end_turn"},
+        [task],
+    )
+
+    assert summary == "Я рабочий ответ от выбранной модели."
+    assert message["message"]["content"] == [{"type": "text", "text": "Я рабочий ответ от выбранной модели."}]
+
+
+def test_orchestrator_uses_single_completed_task_output_as_final_summary(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    session = orchestrator.create_session(tmp_path.as_posix(), "qwen::qwen3-coder-plus")
+    task = PlanTask(
+        title="Respond to user identity question",
+        details="Answer briefly",
+        assignee="qwen",
+        status=TaskStatus.COMPLETED,
+        output="Я итоговый ответ от единственной выполненной задачи.",
+    )
+
+    summary = orchestrator._final_summary([task])
+    message = orchestrator.normalizer.message_update(
+        session,
+        summary,
+        {"summary": summary, "stop_reason": "end_turn"},
+        [task],
+    )
+
+    assert summary == "Я итоговый ответ от единственной выполненной задачи."
+    assert message["message"]["content"] == [{"type": "text", "text": "Я итоговый ответ от единственной выполненной задачи."}]
+
+
+def test_normalizer_ignores_downstream_thought_chunks(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    session = orchestrator.create_session(tmp_path.as_posix(), "qwen::qwen3-coder-plus")
+    task = PlanTask(
+        title="Respond directly to the user",
+        details="Answer briefly",
+        assignee="qwen",
+        _meta={"turnId": "turn-test", "workerCorrelationId": "corr-test"},
+    )
+
+    updates = orchestrator.normalizer.normalize_worker_updates(
+        snapshot=session,
+        task=task,
+        agent=_agents()[1],
+        updates=[
+            {"sessionUpdate": "agent_thought_chunk", "content": {"text": "hidden reasoning"}},
+            {"sessionUpdate": "agent_message_chunk", "content": {"text": "visible answer"}},
+        ],
+    )
+
+    assert len(updates) == 1
+    assert updates[0]["toolCall"]["content"][0]["text"] == "visible answer"
+
+
+def test_normalizer_compacts_worker_tool_updates_and_reduces_raw_payload_noise(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    session = orchestrator.create_session(tmp_path.as_posix(), "qwen::qwen3-coder-plus")
+    task = PlanTask(
+        title="Respond directly to the user",
+        details="Answer briefly",
+        assignee="qwen",
+        _meta={"turnId": "turn-test", "workerCorrelationId": "corr-test"},
+    )
+
+    updates = orchestrator.normalizer.normalize_worker_updates(
+        snapshot=session,
+        task=task,
+        agent=_agents()[1],
+        updates=[
+            {
+                "sessionUpdate": "tool_call_update",
+                "title": "ReadFile: README.md",
+                "status": "completed",
+                "field_meta": {"toolName": "read_file"},
+                "locations": [{"path": "/workspace/OrgeMage/README.md"}],
+                "content": [{"content": {"text": "x" * 500, "type": "text"}, "type": "content"}],
+            }
+        ],
+    )
+
+    assert len(updates) == 1
+    assert updates[0]["toolCall"]["status"] == "completed"
+    assert updates[0]["toolCall"]["content"] == [{"type": "text", "text": "ReadFile: README.md"}]
+    assert updates[0]["_meta"]["rawUpdate"]["toolName"] == "read_file"
+    assert updates[0]["_meta"]["rawUpdate"]["text"] == "ReadFile: README.md"
+    assert "content" not in updates[0]["_meta"]["rawUpdate"]
+
+
+def test_orchestrator_marks_worker_connector_exceptions_failed_without_crashing(tmp_path: Path) -> None:
+    from orgemage.acp.manager import DownstreamConnectorManager
+    from orgemage.models import SessionSnapshot
+
+    class _ExceptionConnector:
+        def __init__(self, agent: DownstreamAgentConfig) -> None:
+            self.agent = agent
+            self.negotiated_state = None
+
+        def discover_catalog(self, *, force: bool = False) -> dict[str, object]:
+            del force
+            return {
+                "agent_id": self.agent.agent_id,
+                "config_options": [],
+                "capabilities": {},
+                "command_advertisements": [],
+            }
+
+        def mark_catalog_refresh_required(self) -> None:
+            return None
+
+        def execute_task(self, *, task, orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model):
+            del orchestrator_session_id, downstream_session_id, cwd, mcp_servers, coordinator_prompt, selected_model, task
+            raise RuntimeError("No previous sessions found for this project.")
+
+        def cancel(self, downstream_session_id: str) -> None:
+            del downstream_session_id
+            return None
+
+    manager = DownstreamConnectorManager(_agents(), connector_factory=_ExceptionConnector)
+    snapshot = SessionSnapshot(session_id="orch-test", cwd=tmp_path.as_posix(), selected_model="codex::gpt-5-codex")
+    task = PlanTask(title="Read workspace", details="Read project files without modifying anything.", assignee="codex")
+
+    result = manager.execute_task(
+        session=snapshot,
+        task=task,
+        coordinator_prompt="Inspect the workspace safely.",
+        selected_model="codex::gpt-5-codex",
+        agent=_agents()[0],
+    )
+
+    assert result.status == TaskStatus.FAILED
+    assert result.summary == "No previous sessions found for this project."
+    assert result.metadata["error"]["type"] == "RuntimeError"
 
 
 class _StreamingConnector:
@@ -543,4 +722,3 @@ def test_orchestrator_propagates_prompt_metadata_into_plan_and_tool_updates(tmp_
     assert tool_update["toolCall"]["_meta"]["traceparent"] == "00-abc-123-01"
     assert tool_update["toolCall"]["_meta"]["assignee"]["agentId"]
     assert result["session"]["metadata"]["session_summary"].startswith("Completed")
-

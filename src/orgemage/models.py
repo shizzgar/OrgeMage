@@ -89,8 +89,12 @@ class DownstreamNegotiatedState:
     agent_capabilities: dict[str, Any] = field(default_factory=dict)
     auth_methods: list[Any] = field(default_factory=list)
     protocol_version: int | None = None
+    profile: dict[str, Any] = field(default_factory=dict)
     session_capabilities: dict[str, dict[str, Any]] = field(default_factory=dict)
+    models: dict[str, dict[str, Any]] = field(default_factory=dict)
+    modes: dict[str, dict[str, Any]] = field(default_factory=dict)
     config_options: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    available_commands: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
     @property
@@ -103,9 +107,30 @@ class DownstreamNegotiatedState:
         session_id: str,
         capabilities: dict[str, Any] | None,
         config_options: list[dict[str, Any]] | None,
+        models: dict[str, Any] | None = None,
+        modes: dict[str, Any] | None = None,
+        available_commands: list[dict[str, Any]] | None = None,
     ) -> None:
         self.session_capabilities[session_id] = capabilities or {}
-        self.config_options[session_id] = config_options or []
+        if config_options or session_id not in self.config_options:
+            self.config_options[session_id] = config_options or []
+        if models:
+            self.models[session_id] = dict(models)
+        if modes:
+            self.modes[session_id] = dict(modes)
+        if available_commands:
+            self.available_commands[session_id] = [dict(command) for command in available_commands]
+
+    def record_available_commands(self, session_id: str, commands: list[dict[str, Any]]) -> None:
+        self.available_commands[session_id] = [dict(command) for command in commands]
+
+    def update_current_mode(self, session_id: str, current_mode_id: str) -> None:
+        current = dict(self.modes.get(session_id, {}))
+        current["currentModeId"] = current_mode_id
+        self.modes[session_id] = current
+
+    def update_config_options(self, session_id: str, config_options: list[dict[str, Any]]) -> None:
+        self.config_options[session_id] = [dict(option) for option in config_options]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,8 +139,12 @@ class DownstreamNegotiatedState:
             "agent_capabilities": self.agent_capabilities,
             "auth_methods": self.auth_methods,
             "protocol_version": self.protocol_version,
+            "profile": self.profile,
             "session_capabilities": self.session_capabilities,
+            "models": self.models,
+            "modes": self.modes,
             "config_options": self.config_options,
+            "available_commands": self.available_commands,
             "diagnostics": self.diagnostics,
         }
 

@@ -14,15 +14,17 @@ from .state import SQLiteSessionStore
 
 def _default_agents(mock_downstream: bool = False) -> list[DownstreamAgentConfig]:
     runtime = "mock" if mock_downstream else "acp"
-    codex_command = os.environ.get("ORGEMAGE_CODEX_ACP_COMMAND", "codex-acp")
+    codex_runtime = "mock" if mock_downstream else "codex-app-server"
+    codex_command = os.environ.get("ORGEMAGE_CODEX_APP_SERVER_COMMAND", "codex")
     return [
         DownstreamAgentConfig(
             agent_id="codex",
             name="Codex",
             command=codex_command,
+            args=[] if mock_downstream else ["app-server"],
             models=[
                 ModelOption(
-                    "gpt-5-codex", "GPT-5 Codex", "Strong coordinator and coding model."
+                    "gpt-5.4", "GPT-5.4", "Latest frontier agentic coding model."
                 ),
             ],
             capabilities=AgentCapabilities(
@@ -33,14 +35,14 @@ def _default_agents(mock_downstream: bool = False) -> list[DownstreamAgentConfig
                 commands=["read", "edit", "test", "search"],
             ),
             description="OpenAI coding agent",
-            default_model="gpt-5-codex",
-            runtime=runtime,
+            default_model="gpt-5.4",
+            runtime=codex_runtime,
         ),
         DownstreamAgentConfig(
             agent_id="gemini",
             name="Gemini CLI",
             command="gemini",
-            args=["--experimental-acp"],
+            args=["--acp"],
             models=[
                 ModelOption(
                     "gemini-2.5-pro",
@@ -84,25 +86,34 @@ def _default_agents(mock_downstream: bool = False) -> list[DownstreamAgentConfig
 
 
 def _is_known_acp_entrypoint(agent: DownstreamAgentConfig) -> bool:
-    command_name = Path(agent.command).name
     if agent.metadata.get("acp_compatible") or agent.metadata.get("acp_entrypoint"):
         return True
+    
+    full_cmd = agent.command
     if agent.agent_id == "codex":
-        return command_name == "codex-acp"
+        return "codex-acp" in full_cmd
     if agent.agent_id == "gemini":
-        return command_name == "gemini" and "--experimental-acp" in agent.args
+        return "gemini" in full_cmd and ("--acp" in agent.args or "--experimental-acp" in agent.args)
     if agent.agent_id == "qwen":
-        return command_name == "qwen" and "--acp" in agent.args
-    return "acp" in command_name
+        return "qwen" in full_cmd and "--acp" in agent.args
+    return "acp" in full_cmd
 
 
 def _validate_agents(
     agents: list[DownstreamAgentConfig],
 ) -> list[DownstreamAgentConfig]:
     for agent in agents:
+        command_name = Path(agent.command).name
+        if agent.runtime == "codex-app-server":
+            if agent.agent_id != "codex":
+                raise ValueError("runtime='codex-app-server' is only supported for the Codex downstream.")
+            if "codex" not in agent.command or "app-server" not in agent.args:
+                raise ValueError(
+                    "Codex app-server downstreams must use command including 'codex' with args including 'app-server'."
+                )
+            continue
         if agent.runtime != "acp":
             continue
-        command_name = Path(agent.command).name
         if agent.agent_id == "codex" and command_name == "codex":
             raise ValueError(
                 "Codex ACP downstreams must use 'codex-acp' (or another ACP bridge marked with metadata.acp_entrypoint=true), not raw 'codex'."
@@ -147,14 +158,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="OrgeMage ACP orchestrator",
         epilog=(
-            "ACP downstream note: codex-acp is the ACP bridge for Codex. "
-            "Raw 'codex' is not guaranteed to be an ACP transport endpoint; use codex-acp, "
+            "Codex downstream note: the default Codex runtime uses 'codex app-server'. "
+            "ACP downstreams still require ACP-compatible entrypoints such as codex-acp, "
             "gemini --experimental-acp, qwen --acp, or a custom wrapper marked metadata.acp_entrypoint=true."
         ),
     )
     parser.add_argument(
         "--config",
-        help="JSON file describing downstream agents; ACP runtime entries must point at ACP-compatible entrypoints such as codex-acp.",
+        help="JSON file describing downstream agents; ACP runtime entries must point at ACP-compatible entrypoints such as codex-acp, while Codex app-server entries use runtime='codex-app-server'.",
     )
     parser.add_argument("--db", default=":memory:", help="SQLite database path")
     parser.add_argument(
@@ -199,6 +210,9 @@ def _emit(data: Any) -> None:
 
 
 def main() -> None:
+    if os.environ.get("ORGEMAGE_DEBUG") == "1":
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
     parser = build_parser()
     args = parser.parse_args()
     orchestrator = _make_orchestrator(args)
@@ -234,7 +248,7 @@ def main() -> None:
 
             import acp  # type: ignore[import-not-found]
 
-            asyncio.run(acp.run_agent(runtime.agent))
+            asyncio.run(acp.run_agent(runtime.agent, use_unstable_protocol=True))
             return
         _emit(
             {

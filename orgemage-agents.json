@@ -3,15 +3,17 @@
     {
       "agent_id": "codex",
       "name": "Codex",
-      "command": "codex-acp",
-      "args": [],
-      "description": "OpenAI coding agent bridged through codex-acp",
-      "default_model": "gpt-5-codex",
-      "runtime": "acp",
+      "command": "codex",
+      "args": [
+        "app-server"
+      ],
+      "description": "OpenAI coding agent",
+      "default_model": "gpt-5.4",
+      "runtime": "codex-app-server",
       "models": [
         {
-          "value": "gpt-5-codex",
-          "name": "GPT-5 Codex",
+          "value": "gpt-5.4",
+          "name": "GPT-5.4",
           "description": "Primary coding model"
         }
       ],
@@ -20,16 +22,23 @@
         "supports_filesystem": true,
         "supports_permissions": true,
         "supports_mcp": true,
-        "commands": ["read", "edit", "test", "search"]
+        "commands": [
+          "read",
+          "edit",
+          "test",
+          "search"
+        ]
       }
     },
     {
       "agent_id": "gemini",
       "name": "Gemini CLI",
       "command": "gemini",
-      "args": ["--experimental-acp"],
+      "args": [
+        "--acp"
+      ],
       "description": "Google Gemini CLI",
-      "default_model": "gemini-2.5-pro",
+      "default_model": "auto-gemini-3",
       "runtime": "acp",
       "models": [
         {
@@ -42,14 +51,20 @@
         "supports_terminal": true,
         "supports_filesystem": true,
         "supports_permissions": true,
-        "commands": ["read", "search", "fetch"]
+        "commands": [
+          "read",
+          "search",
+          "fetch"
+        ]
       }
     },
     {
       "agent_id": "qwen",
       "name": "Qwen Code",
       "command": "qwen",
-      "args": ["--acp"],
+      "args": [
+        "--acp"
+      ],
       "description": "Alibaba Qwen Code",
       "default_model": "qwen3-coder-plus",
       "runtime": "acp",
@@ -64,7 +79,10 @@
         "supports_terminal": true,
         "supports_filesystem": true,
         "supports_permissions": true,
-        "commands": ["edit", "test"]
+        "commands": [
+          "edit",
+          "test"
+        ]
       }
     }
   ]

@@ -82,6 +82,82 @@ def test_federated_model_catalog_prefers_discovered_models_and_tracks_refresh_st
     assert catalog.resolve("codex::discovered-b").option.name == "Discovered B"
 
 
+def test_federated_model_catalog_resolves_bootstrap_alias_against_auth_scoped_discovery() -> None:
+    catalog = FederatedModelCatalog(
+        [
+            DownstreamAgentConfig(
+                agent_id="qwen",
+                name="Qwen",
+                command="qwen",
+                models=[ModelOption(value="qwen3-coder-plus", name="Qwen3 Coder Plus")],
+                capabilities=AgentCapabilities(),
+            )
+        ]
+    )
+
+    catalog.record_discovery(
+        agent_id="qwen",
+        config_options=[
+            {
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "options": [
+                    {
+                        "value": "qwen-oauth/qwen3-coder-plus",
+                        "name": "Qwen3 Coder Plus",
+                    }
+                ],
+            }
+        ],
+        capabilities={},
+        command_advertisements=[],
+    )
+
+    resolved = catalog.resolve("qwen::qwen3-coder-plus")
+
+    assert resolved.agent.agent_id == "qwen"
+    assert resolved.option.value == "qwen-oauth/qwen3-coder-plus"
+
+
+def test_federated_model_catalog_resolves_to_single_discovered_model_when_bootstrap_name_differs() -> None:
+    catalog = FederatedModelCatalog(
+        [
+            DownstreamAgentConfig(
+                agent_id="qwen",
+                name="Qwen",
+                command="qwen",
+                models=[ModelOption(value="qwen3-coder-plus", name="Qwen3 Coder Plus")],
+                capabilities=AgentCapabilities(),
+            )
+        ]
+    )
+
+    catalog.record_discovery(
+        agent_id="qwen",
+        config_options=[
+            {
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "options": [
+                    {
+                        "value": "coder-model(qwen-oauth)",
+                        "name": "coder-model",
+                    }
+                ],
+            }
+        ],
+        capabilities={},
+        command_advertisements=[],
+    )
+
+    resolved = catalog.resolve("qwen::qwen3-coder-plus")
+
+    assert resolved.agent.agent_id == "qwen"
+    assert resolved.option.value == "coder-model(qwen-oauth)"
+
+
 def test_federated_model_catalog_uses_bootstrap_fallback_after_failed_discovery() -> (
     None
 ):
@@ -124,10 +200,11 @@ def test_federated_model_catalog_uses_bootstrap_fallback_after_failed_discovery(
     ]
 
 
-def test_bootstrap_catalog_uses_codex_acp_default() -> None:
+def test_bootstrap_catalog_uses_codex_app_server_default() -> None:
     from orgemage import cli
 
     agents = cli._default_agents()
 
     codex = next(agent for agent in agents if agent.agent_id == "codex")
-    assert codex.command == "codex-acp"
+    assert codex.command == "codex"
+    assert codex.args == ["app-server"]

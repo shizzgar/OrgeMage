@@ -3,9 +3,10 @@ from __future__ import annotations
 from typing import Callable
 
 from ..catalog import FederatedModelCatalog
+from ..codex_app_server import CodexAppServerConnector
 from ..debug import debug_event, get_logger
 from ..downstream import MockDownstreamClient
-from ..models import DownstreamAgentConfig, SessionSnapshot, PlanTask, WorkerResult
+from ..models import DownstreamAgentConfig, SessionSnapshot, PlanTask, TaskStatus, WorkerResult
 from ..state import SQLiteSessionStore
 from .downstream_client import AcpDownstreamConnector, DownstreamConnector, DownstreamPromptResult
 
@@ -99,6 +100,7 @@ class DownstreamConnectorManager:
         self._headless_policy = headless_policy
         self._upstream_client_connection: object | None = None
         self._upstream_capabilities: object | None = None
+        self._active_planning_sessions: dict[str, dict[str, str]] = {}
 
     def bind_upstream_client_connection(self, connection: object | None, *, capabilities: object | None = None) -> None:
         self._upstream_client_connection = connection
@@ -146,24 +148,69 @@ class DownstreamConnectorManager:
         agent: DownstreamAgentConfig,
     ) -> WorkerResult:
         connector = self.get_connector(agent.agent_id)
+        is_planning_task = task._meta.get("phase") == "planning"
+        
+        # Try to get session ID: 
+        # 1. From active planning sessions (if we just finished planning)
+        # 2. From the session snapshot (if it was already saved)
         downstream_session_id = session.get_downstream_session_id(agent.agent_id)
+        if downstream_session_id is None and not is_planning_task:
+            downstream_session_id = self._active_planning_sessions.get(session.session_id, {}).get(agent.agent_id)
+
         debug_event(_LOG, "connector.manager.execute", session_id=session.session_id, task_id=task.task_id, agent_id=agent.agent_id, downstream_session_id=downstream_session_id)
-        prompt_result = connector.execute_task(
-            orchestrator_session_id=session.session_id,
-            downstream_session_id=downstream_session_id,
-            cwd=session.cwd,
-            mcp_servers=session.mcp_servers,
-            task=task,
-            coordinator_prompt=coordinator_prompt,
-            selected_model=selected_model,
-        )
-        session.set_downstream_session_mapping(agent.agent_id, prompt_result.downstream_session_id)
-        if self._store is not None:
-            self._store.save_downstream_session_mapping(
-                session.session_id,
-                agent.agent_id,
-                prompt_result.downstream_session_id,
+        try:
+            prompt_result = connector.execute_task(
+                orchestrator_session_id=session.session_id,
+                downstream_session_id=downstream_session_id,
+                cwd=session.cwd,
+                mcp_servers=session.mcp_servers,
+                task=task,
+                coordinator_prompt=coordinator_prompt,
+                selected_model=selected_model,
             )
+        except Exception as exc:
+            summary = _exception_summary(exc)
+            metadata = {
+                "promptMetadata": dict(task._meta),
+                "error": {
+                    "type": type(exc).__name__,
+                    "summary": summary,
+                    "code": getattr(exc, "code", None),
+                    "method": getattr(exc, "method", None),
+                    "message": getattr(exc, "message", None),
+                    "data": getattr(exc, "data", None),
+                },
+            }
+            if downstream_session_id is not None:
+                metadata["downstream_session_id"] = downstream_session_id
+            debug_event(
+                _LOG,
+                "connector.manager.execute.failed",
+                session_id=session.session_id,
+                task_id=task.task_id,
+                agent_id=agent.agent_id,
+                downstream_session_id=downstream_session_id,
+                error_summary=summary,
+                error_type=type(exc).__name__,
+            )
+            return WorkerResult(
+                task_id=task.task_id,
+                agent_id=agent.agent_id,
+                status=TaskStatus.FAILED,
+                summary=summary,
+                raw_output=summary,
+                metadata=metadata,
+            )
+        if not is_planning_task:
+            session.set_downstream_session_mapping(agent.agent_id, prompt_result.downstream_session_id)
+            if self._store is not None:
+                self._store.save_downstream_session_mapping(
+                    session.session_id,
+                    agent.agent_id,
+                    prompt_result.downstream_session_id,
+                )
+        else:
+            self._active_planning_sessions.setdefault(session.session_id, {})[agent.agent_id] = prompt_result.downstream_session_id
         negotiated = getattr(connector, "negotiated_state", None)
         if negotiated is not None:
             session.metadata.setdefault("downstream_negotiated", {})[agent.agent_id] = negotiated.to_dict()
@@ -183,9 +230,10 @@ class DownstreamConnectorManager:
 
     def cancel_session(self, session: SessionSnapshot, agent_id: str | None = None) -> None:
         mappings = session.downstream_session_map()
-        target_ids = [agent_id] if agent_id else list(mappings.keys())
+        planning_mappings = self._active_planning_sessions.get(session.session_id, {})
+        target_ids = [agent_id] if agent_id else sorted(set(mappings.keys()) | set(planning_mappings.keys()))
         for current_agent_id in target_ids:
-            downstream_session_id = mappings.get(current_agent_id)
+            downstream_session_id = mappings.get(current_agent_id) or planning_mappings.get(current_agent_id)
             if downstream_session_id is None:
                 continue
             debug_event(_LOG, "connector.manager.cancel", session_id=session.session_id, agent_id=current_agent_id, downstream_session_id=downstream_session_id)
@@ -198,6 +246,11 @@ class DownstreamConnectorManager:
     def _build_connector(self, agent: DownstreamAgentConfig) -> DownstreamConnector:
         if agent.runtime == "mock":
             return _MockConnectorAdapter(agent)
+        if agent.runtime == "codex-app-server":
+            return CodexAppServerConnector(
+                agent,
+                headless_policy=self._headless_policy,
+            )
         return AcpDownstreamConnector(
             agent,
             store=self._store,
@@ -205,3 +258,18 @@ class DownstreamConnectorManager:
             upstream_capabilities_getter=lambda: self._upstream_capabilities,
             headless_policy=self._headless_policy,
         )
+
+
+def _exception_summary(exc: Exception) -> str:
+    data = getattr(exc, "data", None)
+    if isinstance(data, dict):
+        details = data.get("details")
+        if isinstance(details, str) and details.strip():
+            return details.strip()
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    rendered = str(exc).strip()
+    if rendered:
+        return rendered
+    return type(exc).__name__

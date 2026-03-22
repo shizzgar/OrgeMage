@@ -29,10 +29,10 @@ class SQLiteSessionStore:
     def _connect(self) -> sqlite3.Connection:
         if self.db_path == ":memory:":
             if self._memory_connection is None:
-                self._memory_connection = sqlite3.connect(":memory:")
+                self._memory_connection = sqlite3.connect(":memory:", check_same_thread=False)
                 self._memory_connection.row_factory = sqlite3.Row
             return self._memory_connection
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 

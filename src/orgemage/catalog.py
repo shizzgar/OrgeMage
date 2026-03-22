@@ -156,9 +156,12 @@ class FederatedModelCatalog:
         if agent is None:
             raise KeyError(f"Unknown agent: {agent_id}")
         state = self._runtime_state[agent_id]
-        for option in state.effective_model_values(agent.models):
-            if option.value == raw_model:
+        effective_models = state.effective_model_values(agent.models)
+        for option in effective_models:
+            if raw_model in _model_aliases(option.value):
                 return ResolvedModel(composite_value=composite_value, agent=agent, option=option)
+        if len(effective_models) == 1:
+            return ResolvedModel(composite_value=composite_value, agent=agent, option=effective_models[0])
         raise KeyError(f"Unknown model '{raw_model}' for agent '{agent_id}'")
 
 
@@ -185,3 +188,13 @@ def _extract_discovered_model_options(
             )
             seen_values.add(value)
     return discovered
+
+
+def _model_aliases(value: str) -> set[str]:
+    aliases = {value}
+    for separator in ("/", "::"):
+        if separator in value:
+            _, _, suffix = value.rpartition(separator)
+            if suffix:
+                aliases.add(suffix)
+    return aliases

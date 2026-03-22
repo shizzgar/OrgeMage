@@ -4,8 +4,11 @@ import asyncio
 from datetime import datetime, timezone
 import importlib.util
 import logging
+import queue
+import threading
 from typing import Any
 
+from .. import __version__
 from ..metadata import extract_prompt_metadata
 from ..orchestrator import Orchestrator
 
@@ -50,6 +53,54 @@ def _extract_mcp_servers(kwargs: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             normalized.append({"id": f"mcp-{index}", "value": server})
     return normalized
+
+
+def _first_nonempty_str(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str):
+            normalized = value.strip()
+            if normalized:
+                return normalized
+    return None
+
+
+def _nested_mapping_value(mapping: dict[str, Any], *path: str) -> Any:
+    current: Any = mapping
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _extract_requested_model(kwargs: dict[str, Any]) -> str | None:
+    direct_model = _first_nonempty_str(
+        kwargs.get("model"),
+        kwargs.get("model_id"),
+        kwargs.get("modelId"),
+        kwargs.get("selected_model"),
+        kwargs.get("selectedModel"),
+        _nested_mapping_value(kwargs, "options", "model"),
+        _nested_mapping_value(kwargs, "claudeCode", "model"),
+        _nested_mapping_value(kwargs, "claudeCode", "options", "model"),
+    )
+    if direct_model is not None:
+        return direct_model
+    meta = kwargs.get("_meta")
+    if not isinstance(meta, dict):
+        meta = kwargs.get("meta")
+    if not isinstance(meta, dict):
+        return None
+    return _first_nonempty_str(
+        meta.get("model"),
+        meta.get("model_id"),
+        meta.get("modelId"),
+        meta.get("selected_model"),
+        meta.get("selectedModel"),
+        _nested_mapping_value(meta, "options", "model"),
+        _nested_mapping_value(meta, "claudeCode", "model"),
+        _nested_mapping_value(meta, "claudeCode", "options", "model"),
+    )
 
 
 class AcpSdkBridge:
@@ -108,7 +159,7 @@ class AcpAgentRuntime:
     async def new_session(self, cwd: str, **kwargs: Any) -> Any:
         session = self.orchestrator.create_session(
             cwd,
-            kwargs.get("model"),
+            _extract_requested_model(kwargs),
             mcp_servers=_extract_mcp_servers(kwargs),
         )
         response = _build_new_session_response(self.acp, session.session_id, self.orchestrator)
@@ -119,7 +170,7 @@ class AcpAgentRuntime:
         del cwd
         snapshot = self.orchestrator.load_session(
             session_id,
-            selected_model=kwargs.get("model"),
+            selected_model=_extract_requested_model(kwargs),
             mcp_servers=_extract_mcp_servers(kwargs),
         )
         response = _build_load_session_response(self.acp, snapshot.session_id, self.orchestrator)
@@ -172,26 +223,64 @@ class AcpAgentRuntime:
         slash_command_response = await self._maybe_handle_slash_command(session_id, text)
         if slash_command_response is not None:
             return slash_command_response
-        loop = asyncio.get_running_loop()
+        deferred_updates: list[dict[str, Any]] = []
+        streaming_updates: queue.Queue[dict[str, Any]] = queue.Queue()
+        result_holder: dict[str, dict[str, Any]] = {}
+        error_holder: dict[str, BaseException] = {}
+        worker_done = threading.Event()
 
         def emit_update(update: dict[str, Any]) -> None:
-            future = asyncio.run_coroutine_threadsafe(self._send_session_update(session_id, update), loop)
-            future.result()
+            session_update = str(update.get("sessionUpdate") or update.get("session_update") or "")
+            if session_update in {"message", "session_info"}:
+                deferred_updates.append(dict(update))
+                return
+            streaming_updates.put(dict(update))
+
+        def run_orchestration() -> None:
+            try:
+                result_holder["result"] = self.orchestrator.orchestrate_turn(
+                    session_id,
+                    text,
+                    emit_update=emit_update,
+                    prompt_metadata=prompt_metadata,
+                )
+            except BaseException as exc:
+                error_holder["error"] = exc
+            finally:
+                worker_done.set()
 
         task = asyncio.current_task()
         if task is not None:
             self._prompt_tasks[session_id] = task
+        worker = threading.Thread(
+            target=run_orchestration,
+            name=f"orgemage-prompt-{session_id[:8]}",
+            daemon=True,
+        )
+        worker.start()
         try:
-            result = await asyncio.to_thread(
-                self.orchestrator.orchestrate_turn,
-                session_id,
-                text,
-                emit_update=emit_update,
-                prompt_metadata=prompt_metadata,
-            )
+            while True:
+                drained = False
+                while True:
+                    try:
+                        update = streaming_updates.get_nowait()
+                    except queue.Empty:
+                        break
+                    drained = True
+                    await self._send_session_update(session_id, update)
+                if worker_done.is_set():
+                    if streaming_updates.empty():
+                        break
+                if not drained:
+                    await asyncio.sleep(0.01)
         finally:
             self._prompt_tasks.pop(session_id, None)
-        await self._send_session_info_update(session_id)
+            if worker_done.is_set():
+                worker.join(timeout=0)
+        if "error" in error_holder:
+            raise error_holder["error"]
+        result = result_holder["result"]
+        await self._send_post_prompt_updates(session_id, deferred_updates)
         return self._build_prompt_response(result["summary"], stop_reason=str(result.get("stop_reason") or "end_turn"))
 
     async def cancel(self, session_id: str, **kwargs: Any) -> Any:
@@ -310,6 +399,11 @@ class AcpAgentRuntime:
         self._background_tasks.add(task)
         task.add_done_callback(self._finalize_background_task)
 
+    async def _send_post_prompt_updates(self, session_id: str, updates: list[dict[str, Any]]) -> None:
+        for update in updates:
+            await self._send_session_update(session_id, update)
+        await self._send_session_info_update(session_id)
+
     def _finalize_background_task(self, task: asyncio.Task[Any]) -> None:
         self._background_tasks.discard(task)
         if task.cancelled():
@@ -355,10 +449,19 @@ def _build_agent(acp: Any, runtime: AcpAgentRuntime) -> Any:
         async def set_config_option(self, config_id: str, session_id: str, value: str, **kwargs: Any) -> Any:
             return await self.runtime.set_config_option(session_id, config_id, value, **kwargs)
 
+        async def session_set_config_option(self, session_id: str, config_id: str, value: str, **kwargs: Any) -> Any:
+            return await self.runtime.set_config_option(session_id, config_id, value, **kwargs)
+
         async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> Any:
             return await self.runtime.set_session_model(session_id, model_id, **kwargs)
 
+        async def session_set_model(self, session_id: str, model_id: str, **kwargs: Any) -> Any:
+            return await self.runtime.set_session_model(session_id, model_id, **kwargs)
+
         async def set_session_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> Any:
+            return await self.runtime.set_session_mode(session_id, mode_id, **kwargs)
+
+        async def session_set_mode(self, session_id: str, mode_id: str, **kwargs: Any) -> Any:
             return await self.runtime.set_session_mode(session_id, mode_id, **kwargs)
 
         async def set_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> Any:
@@ -399,7 +502,7 @@ def _build_initialize_response(acp: Any, protocol_version: int) -> Any:
             mcpCapabilities=mcp_capabilities_type() if mcp_capabilities_type is not None else None,
             promptCapabilities=prompt_capabilities_type() if prompt_capabilities_type is not None else None,
         ),
-        agentInfo=implementation_type(name="orgemage", title="OrgeMage", version="0.1.0")
+        agentInfo=implementation_type(name="orgemage", title="OrgeMage", version=__version__)
         if implementation_type is not None
         else None,
     )
@@ -758,11 +861,18 @@ def _plan_status_label(value: Any) -> str:
 
 
 def _config_option_payload(option: Any) -> dict[str, Any]:
-    if isinstance(option, dict):
-        return dict(option)
-    payload = dict(getattr(option, "__dict__", {}))
+    if hasattr(option, "model_dump"):
+        payload = option.model_dump(mode="json", by_alias=True, exclude_none=True)
+        if isinstance(payload, dict) and "root" in payload and isinstance(payload["root"], dict):
+            payload = dict(payload["root"])
+    elif isinstance(option, dict):
+        payload = dict(option)
+    else:
+        payload = dict(getattr(option, "__dict__", {}))
     if "current_value" in payload and "currentValue" not in payload:
         payload["currentValue"] = payload.pop("current_value")
+    if "values" in payload and "options" not in payload:
+        payload["options"] = payload.pop("values")
     return payload
 
 

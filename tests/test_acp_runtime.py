@@ -581,7 +581,10 @@ def test_acp_runtime_prompt_returns_cancelled_stop_reason_for_active_turn(tmp_pa
                 [_FakeAcp.TextBlock("Cancel this turn while planning is still running.")],
             )
         )
-        await asyncio.to_thread(planning_started.wait, 5)
+        deadline = asyncio.get_running_loop().time() + 5
+        while not planning_started.is_set():
+            assert asyncio.get_running_loop().time() < deadline
+            await asyncio.sleep(0.01)
         await runtime.cancel(created.session_id)
         response = await prompt_task
         assert response.stop_reason == "cancelled"
@@ -676,6 +679,52 @@ def test_acp_runtime_supports_modern_acp_schema_shapes(tmp_path: Path) -> None:
         update for _, update in connection.updates if getattr(update, "sessionUpdate", None) == "available_commands_update"
     ]
     assert [command["name"] for command in available_command_updates[-1].availableCommands] == ["status", "models", "plan"]
+
+
+def test_acp_runtime_accepts_model_from_meta_options_on_new_session(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    runtime = AcpAgentRuntime(acp=_FakeModernAcp, orchestrator=orchestrator)
+
+    async def scenario() -> None:
+        created = await runtime.new_session(
+            tmp_path.as_posix(),
+            _meta={"claudeCode": {"options": {"model": "qwen::qwen3-coder-plus"}}},
+        )
+        assert created.config_options[0].currentValue == "qwen::qwen3-coder-plus"
+        assert created.models.current_model_id == "qwen::qwen3-coder-plus"
+
+    asyncio.run(scenario())
+
+
+def test_acp_runtime_accepts_model_from_flattened_meta_options_on_new_session(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    runtime = AcpAgentRuntime(acp=_FakeModernAcp, orchestrator=orchestrator)
+
+    async def scenario() -> None:
+        created = await runtime.new_session(
+            tmp_path.as_posix(),
+            claudeCode={"options": {"model": "qwen::qwen3-coder-plus"}},
+        )
+        assert created.config_options[0].currentValue == "qwen::qwen3-coder-plus"
+        assert created.models.current_model_id == "qwen::qwen3-coder-plus"
+
+    asyncio.run(scenario())
+
+
+def test_acp_runtime_agent_exposes_session_method_aliases(tmp_path: Path) -> None:
+    orchestrator = Orchestrator(_agents(), SQLiteSessionStore(tmp_path / "state.db"))
+    runtime = AcpAgentRuntime(acp=_FakeModernAcp, orchestrator=orchestrator)
+
+    async def scenario() -> None:
+        created = await runtime.new_session(tmp_path.as_posix(), model="codex::gpt-5-codex")
+        model_response = await runtime.agent.session_set_model(created.session_id, "qwen::qwen3-coder-plus")
+        assert isinstance(model_response, _FakeModernAcp.SetSessionModelResponse)
+        mode_response = await runtime.agent.session_set_mode(created.session_id, "full-access")
+        assert isinstance(mode_response, _FakeModernAcp.SetSessionModeResponse)
+        config_response = await runtime.agent.session_set_config_option(created.session_id, "model", "codex::gpt-5-codex")
+        assert config_response.config_options[0].currentValue == "codex::gpt-5-codex"
+
+    asyncio.run(scenario())
 
 
 def test_acp_runtime_mode_round_trip_and_updates(tmp_path: Path) -> None:

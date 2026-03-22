@@ -1,5 +1,6 @@
 from pathlib import Path
 import sqlite3
+import threading
 
 from orgemage.models import (
     OrchestrationTurnState,
@@ -214,3 +215,28 @@ def test_store_can_cancel_outstanding_permissions_and_terminals(tmp_path: Path) 
     assert loaded.permission_requests[1].status == "decided"
     assert cancelled_terminals[0].status == "cancelled"
     assert loaded.terminal_mappings[0].metadata["cleanup_reason"] == "test"
+
+
+def test_sqlite_session_store_file_db_can_be_used_across_threads(tmp_path: Path) -> None:
+    store = SQLiteSessionStore(tmp_path / "orgemage.db")
+    store.save(SessionSnapshot(session_id="threaded", cwd="/tmp/project"))
+
+    failure: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            snapshot = store.load("threaded")
+            assert snapshot is not None
+            snapshot.title = "Updated from worker"
+            store.save(snapshot)
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            failure.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join(timeout=5)
+
+    assert failure == []
+    reloaded = store.load("threaded")
+    assert reloaded is not None
+    assert reloaded.title == "Updated from worker"

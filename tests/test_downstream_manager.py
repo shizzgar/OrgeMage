@@ -118,3 +118,91 @@ def test_connector_manager_refreshes_catalog_from_discovery() -> None:
     options = catalog.northbound_model_options()
     assert [item["value"] for item in options] == ["codex::discovered-model"]
     assert options[0]["metadata"]["source"] == "discovery"
+
+
+def test_connector_manager_does_not_reuse_or_persist_planning_sessions() -> None:
+    agent = DownstreamAgentConfig(
+        agent_id="qwen",
+        name="Qwen",
+        command="qwen",
+        models=[ModelOption(value="qwen3-coder-plus", name="Qwen3 Coder Plus")],
+    )
+    created: list[RecordingConnector] = []
+
+    def factory(current_agent: DownstreamAgentConfig):
+        connector = RecordingConnector(current_agent)
+        created.append(connector)
+        return connector
+
+    manager = DownstreamConnectorManager([agent], connector_factory=factory)
+    session = SessionSnapshot(session_id="orch-2", cwd="/tmp/project")
+    session.set_downstream_session_mapping("qwen", "existing-execution-session")
+    planning_task = PlanTask(
+        title="Generate structured orchestration plan",
+        details="Plan the next turn.",
+        assignee="qwen",
+        _meta={"phase": "planning"},
+    )
+    execution_task = PlanTask(
+        title="Respond directly to the user",
+        details="Answer the user request.",
+        assignee="qwen",
+    )
+
+    planning_result = manager.execute_task(
+        session=session,
+        task=planning_task,
+        coordinator_prompt="Plan",
+        selected_model="qwen3-coder-plus",
+        agent=agent,
+    )
+    execution_result = manager.execute_task(
+        session=session,
+        task=execution_task,
+        coordinator_prompt="Execute",
+        selected_model="qwen3-coder-plus",
+        agent=agent,
+    )
+
+    assert planning_result.metadata["downstream_session_id"] == "downstream-qwen"
+    assert execution_result.metadata["downstream_session_id"] == "existing-execution-session"
+    assert session.downstream_session_map()["qwen"] == "existing-execution-session"
+    assert created[0].calls[0]["downstream_session_id"] is None
+    assert created[0].calls[1]["downstream_session_id"] == "existing-execution-session"
+
+
+def test_connector_manager_can_cancel_with_ephemeral_planning_session() -> None:
+    agent = DownstreamAgentConfig(
+        agent_id="qwen",
+        name="Qwen",
+        command="qwen",
+        models=[ModelOption(value="qwen3-coder-plus", name="Qwen3 Coder Plus")],
+    )
+    created: list[RecordingConnector] = []
+
+    def factory(current_agent: DownstreamAgentConfig):
+        connector = RecordingConnector(current_agent)
+        created.append(connector)
+        return connector
+
+    manager = DownstreamConnectorManager([agent], connector_factory=factory)
+    session = SessionSnapshot(session_id="orch-3", cwd="/tmp/project")
+    planning_task = PlanTask(
+        title="Generate structured orchestration plan",
+        details="Plan the next turn.",
+        assignee="qwen",
+        _meta={"phase": "planning"},
+    )
+
+    planning_result = manager.execute_task(
+        session=session,
+        task=planning_task,
+        coordinator_prompt="Plan",
+        selected_model="qwen3-coder-plus",
+        agent=agent,
+    )
+    manager.cancel_session(session)
+
+    assert planning_result.metadata["downstream_session_id"] == "downstream-qwen"
+    assert session.downstream_session_map() == {}
+    assert {"cancel": "downstream-qwen"} in created[0].calls

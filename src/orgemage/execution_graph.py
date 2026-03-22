@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import asyncio
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -84,7 +84,8 @@ class ExecutionGraphRunner:
         self.cancel_active_work = cancel_active_work
         self.events: list[ToolEvent] = []
         self._nodes: dict[str, _RuntimeNode] = {}
-        self._inflight: dict[asyncio.Task[WorkerResult], PlanTask] = {}
+        self._inflight: dict[Future[WorkerResult], PlanTask] = {}
+        self._executor: ThreadPoolExecutor | None = None
         self._stop_scheduling = False
 
         for task in self.tasks:
@@ -93,22 +94,25 @@ class ExecutionGraphRunner:
             self._nodes[task.task_id] = _RuntimeNode(task=task, state=state)
 
     def run(self) -> list[ToolEvent]:
-        asyncio.run(self._run())
+        max_workers = max(1, len(self.tasks))
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="orgemage-task") as executor:
+            self._executor = executor
+            self._run()
         return list(self.events)
 
-    async def _run(self) -> None:
+    def _run(self) -> None:
         self._refresh_dependency_states()
         self.emit_plan_update()
         while True:
             if self.is_cancel_requested():
-                await self._handle_cancellation()
+                self._handle_cancellation()
                 break
-            launched = await self._launch_ready_tasks()
+            launched = self._launch_ready_tasks()
             if not self._inflight:
                 if not launched:
                     break
                 continue
-            completed, _ = await asyncio.wait(self._inflight.keys(), timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
+            completed, _ = wait(tuple(self._inflight.keys()), timeout=0.05, return_when=FIRST_COMPLETED)
             if not completed:
                 continue
             for future in completed:
@@ -118,8 +122,9 @@ class ExecutionGraphRunner:
                 result = future.result()
                 self._handle_result(task, result)
 
-    async def _launch_ready_tasks(self) -> bool:
+    def _launch_ready_tasks(self) -> bool:
         launched = False
+        assert self._executor is not None
         for task in self.tasks:
             if self._stop_scheduling:
                 break
@@ -147,15 +152,13 @@ class ExecutionGraphRunner:
             self.events.append(started_event)
             self.emit_tool_event(task, started_event)
             agent = self.agents_by_id[task.assignee or self.coordinator_agent.agent_id]
-            future = asyncio.create_task(
-                asyncio.to_thread(
-                    self.execute_task,
-                    self.snapshot,
-                    task,
-                    self.coordinator_prompt,
-                    self.selected_model,
-                    agent,
-                )
+            future = self._executor.submit(
+                self.execute_task,
+                self.snapshot,
+                task,
+                self.coordinator_prompt,
+                self.selected_model,
+                agent,
             )
             self._inflight[future] = task
             launched = True
@@ -196,11 +199,11 @@ class ExecutionGraphRunner:
         self.events.append(event)
         self.emit_tool_event(task, event)
 
-    async def _handle_cancellation(self) -> None:
+    def _handle_cancellation(self) -> None:
         self._stop_scheduling = True
         debug_event(_LOG, "execution_graph.cancel", session_id=self.snapshot.session_id, turn_id=self.turn.turn_id, inflight_task_ids=[task.task_id for task in self._inflight.values()])
         self.cancel_active_work()
-        for future in self._inflight:
+        for future in tuple(self._inflight):
             future.cancel()
         for task in self.tasks:
             if task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}:
@@ -212,8 +215,6 @@ class ExecutionGraphRunner:
             self.emit_tool_event(task, event)
         self._refresh_dependency_states()
         self.emit_plan_update()
-        if self._inflight:
-            await asyncio.gather(*self._inflight.keys(), return_exceptions=True)
         self._inflight.clear()
 
     def _refresh_dependency_states(self) -> None:

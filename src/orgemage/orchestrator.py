@@ -25,7 +25,7 @@ from .models import (
     TraceCorrelationState,
     TurnStatus,
 )
-from .planning import PlanParseResult, parse_coordinator_plan, synthesize_local_fallback_plan
+from .planning import PlanParseResult, optimize_coordinator_plan, parse_coordinator_plan, synthesize_local_fallback_plan
 from .scheduler import Scheduler
 from .state import SQLiteSessionStore
 
@@ -83,6 +83,8 @@ class OrchestrationEventNormalizer:
         normalized: list[dict[str, Any]] = []
         turn_id = str(task._meta.get("turnId") or snapshot.metadata.get("turn_context", {}).get("turnId") or "")
         for index, update in enumerate(updates):
+            if self._session_update_kind(update) == "agent_thought_chunk":
+                continue
             tool_call_id = self._resolve_tool_call_id(task, update, index=index)
             locations = self._extract_locations(update)
             terminal = self._extract_terminal(update)
@@ -104,14 +106,14 @@ class OrchestrationEventNormalizer:
                     )
                 ]
                 snapshot.terminal_mappings.append(mapping)
-            content = self._extract_text(update)
+            content = self._extract_worker_content(update, locations=locations, terminal=terminal)
             if not content and not locations and terminal is None:
                 continue
             event = ToolEvent(
                 tool_call_id=tool_call_id,
                 title=task.title,
                 kind="delegate",
-                status=TaskStatus.IN_PROGRESS,
+                status=self._extract_worker_status(update),
                 content=content,
                 locations=locations,
                 terminal=terminal,
@@ -125,7 +127,7 @@ class OrchestrationEventNormalizer:
                     extra={
                         "taskId": task.task_id,
                         "workerAgentId": agent.agent_id,
-                        "rawUpdate": update,
+                        "rawUpdate": self._compact_raw_update(update),
                         "toolCallId": tool_call_id,
                     },
                 ),
@@ -142,7 +144,7 @@ class OrchestrationEventNormalizer:
     ) -> dict[str, Any]:
         blocks = [{"type": "text", "text": summary}]
         for task in tasks:
-            if task.output:
+            if task.output and task.output != summary:
                 blocks.append({"type": "text", "text": f"{task.title}: {task.output}"})
         return {
             "sessionUpdate": "message",
@@ -257,7 +259,7 @@ class OrchestrationEventNormalizer:
             location = payload.get("location")
             if isinstance(location, dict):
                 found.append(dict(location))
-            path = payload.get("path")
+            path = payload.get("path") or payload.get("absolute_path") or payload.get("absolutePath") or payload.get("relative_path") or payload.get("relativePath")
             if isinstance(path, str) and path:
                 candidate = {"path": path}
                 if isinstance(payload.get("line"), int):
@@ -309,6 +311,111 @@ class OrchestrationEventNormalizer:
             return "\n".join(part for part in parts if part)
         return ""
 
+    def _extract_worker_content(
+        self,
+        payload: Any,
+        *,
+        locations: list[dict[str, Any]],
+        terminal: dict[str, Any] | None,
+    ) -> str:
+        kind = self._session_update_kind(payload)
+        if kind in {"tool_call", "tool_call_update"}:
+            title = self._extract_tool_update_title(payload)
+            if title:
+                return title
+            tool_name = self._extract_tool_name(payload)
+            if tool_name and locations:
+                paths = ", ".join(str(location.get("path")) for location in locations if location.get("path"))
+                if paths:
+                    return f"{tool_name}: {paths}"
+            if tool_name:
+                status = self._extract_worker_status(payload)
+                if status == TaskStatus.COMPLETED:
+                    return f"{tool_name} completed"
+                if status == TaskStatus.FAILED:
+                    return f"{tool_name} failed"
+                if status == TaskStatus.CANCELLED:
+                    return f"{tool_name} cancelled"
+                return tool_name
+            if tool_name and terminal is not None:
+                return tool_name
+        content = self._extract_text(payload)
+        if len(content) > 400:
+            return f"{content[:397]}..."
+        return content
+
+    def _extract_worker_status(self, payload: Any) -> TaskStatus:
+        if isinstance(payload, dict):
+            status = payload.get("status")
+            if isinstance(status, str):
+                normalized = status.strip().lower()
+                if normalized in {"completed", "complete", "done", "success", "succeeded"}:
+                    return TaskStatus.COMPLETED
+                if normalized in {"failed", "error"}:
+                    return TaskStatus.FAILED
+                if normalized in {"cancelled", "canceled"}:
+                    return TaskStatus.CANCELLED
+        return TaskStatus.IN_PROGRESS
+
+    def _extract_tool_update_title(self, payload: Any) -> str:
+        if isinstance(payload, dict):
+            title = payload.get("title")
+            if isinstance(title, str) and title.strip():
+                return title.strip()
+        return ""
+
+    def _extract_tool_name(self, payload: Any) -> str:
+        if isinstance(payload, dict):
+            field_meta = payload.get("field_meta") or payload.get("fieldMeta")
+            if isinstance(field_meta, dict):
+                tool_name = field_meta.get("toolName") or field_meta.get("tool_name")
+                if isinstance(tool_name, str) and tool_name.strip():
+                    return tool_name.strip()
+            for value in payload.values():
+                tool_name = self._extract_tool_name(value)
+                if tool_name:
+                    return tool_name
+        elif isinstance(payload, list):
+            for item in payload:
+                tool_name = self._extract_tool_name(item)
+                if tool_name:
+                    return tool_name
+        return ""
+
+    def _compact_raw_update(self, payload: Any) -> dict[str, Any]:
+        compact: dict[str, Any] = {}
+        if not isinstance(payload, dict):
+            return compact
+        for key in ("sessionUpdate", "session_update", "title", "status", "kind"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                compact[key] = value
+        tool_name = self._extract_tool_name(payload)
+        if tool_name:
+            compact["toolName"] = tool_name
+        tool_call_id = self._extract_tool_call_id(payload)
+        if tool_call_id:
+            compact["toolCallId"] = tool_call_id
+        locations = self._extract_locations(payload)
+        if locations:
+            compact["locations"] = locations
+        terminal = self._extract_terminal(payload)
+        if terminal is not None:
+            compact["terminal"] = {
+                "terminalId": terminal.get("terminalId"),
+                "content": terminal.get("content"),
+            }
+        text = self._extract_worker_content(payload, locations=locations, terminal=terminal)
+        if text:
+            compact["text"] = text[:200]
+        return compact
+
+    def _session_update_kind(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        value = payload.get("session_update") or payload.get("sessionUpdate")
+        return value if isinstance(value, str) else ""
+
 
 class Orchestrator:
     SESSION_MODES: tuple[dict[str, str], ...] = (
@@ -355,17 +462,21 @@ class Orchestrator:
         mcp_servers: list[dict[str, Any]] | list[Any] | None = None,
     ) -> SessionSnapshot:
         normalized_cwd = str(Path(cwd).resolve())
+        effective_model = selected_model
+        if effective_model is None:
+            options = self.catalog.northbound_model_options()
+            if options:
+                effective_model = str(options[0]["value"])
         snapshot = SessionSnapshot(
             session_id=f"orch-{uuid.uuid4().hex[:12]}",
             cwd=normalized_cwd,
-            selected_model=selected_model,
+            selected_model=effective_model,
             current_mode_id=self.DEFAULT_SESSION_MODE,
             title=f"OrgeMage: {Path(normalized_cwd).name or normalized_cwd}",
         )
         snapshot.set_mcp_servers(mcp_servers)
-        if selected_model:
-            self._refresh_catalog_for_model(selected_model)
-            resolved = self.catalog.resolve(selected_model)
+        if effective_model:
+            resolved = self.catalog.resolve(effective_model)
             snapshot.coordinator_agent_id = resolved.agent.agent_id
         self.store.save(snapshot)
         return snapshot
@@ -419,7 +530,6 @@ class Orchestrator:
 
     def set_selected_model(self, session_id: str, composite_model: str) -> SessionSnapshot:
         snapshot = self._require_session(session_id)
-        self._refresh_catalog_for_model(composite_model)
         resolved = self.catalog.resolve(composite_model)
         snapshot.selected_model = composite_model
         snapshot.coordinator_agent_id = resolved.agent.agent_id
@@ -448,8 +558,13 @@ class Orchestrator:
         *,
         emit_update: SessionUpdateCallback | None = None,
         prompt_metadata: dict[str, Any] | None = None,
-    ) -> None:
-        self._execute_turn(session_id, user_prompt, emit_update=emit_update, prompt_metadata=prompt_metadata)
+    ) -> dict[str, object]:
+        return self._execute_turn(
+            session_id,
+            user_prompt,
+            emit_update=emit_update,
+            prompt_metadata=prompt_metadata,
+        )
 
     def orchestrate_turn(
         self,
@@ -482,8 +597,11 @@ class Orchestrator:
         if not snapshot.selected_model:
             default_option = self.list_model_options()[0]["value"]
             snapshot = self.set_selected_model(session_id, default_option)
-        self._refresh_catalog_for_model(snapshot.selected_model or "")
-        resolved = self.catalog.resolve(snapshot.selected_model or "")
+        local_response = self._maybe_build_local_response(snapshot, user_prompt)
+        resolved = None
+        if local_response is None:
+            self._refresh_catalog_for_model(snapshot.selected_model or "")
+            resolved = self.catalog.resolve(snapshot.selected_model or "")
 
         turn = OrchestrationTurnState(status=TurnStatus.RUNNING, turn_id=f"turn-{uuid.uuid4().hex[:12]}")
         history_fields = summarize_session(user_prompt)
@@ -503,6 +621,43 @@ class Orchestrator:
         cancel_event = self._register_turn(session_id, turn.turn_id)
 
         try:
+            if local_response is not None:
+                turn.status = TurnStatus.COMPLETED
+                turn.stop_reason = "end_turn"
+                self.store.create_or_update_turn_state(snapshot.session_id, turn)
+                self._update_session_history(snapshot, user_prompt=user_prompt, final_summary=local_response)
+                self.store.save(snapshot)
+                snapshot = self._require_session(session_id)
+                coordinator = self._coordinator_record(snapshot.selected_model or "")
+                result = {
+                    "session": snapshot.to_dict(),
+                    "coordinator": coordinator,
+                    "planning": {
+                        "raw_coordinator_output": "",
+                        "normalized_plan": {
+                            "tasks": [],
+                            "_meta": {
+                                "source": "local_response",
+                                "coordinator_agent_id": coordinator["agent_id"],
+                                "selected_model": coordinator["composite_model"],
+                            },
+                        },
+                        "planner_task": None,
+                        "planner_result": {
+                            "status": TaskStatus.COMPLETED.value,
+                            "summary": "Handled by OrgeMage local response path.",
+                            "metadata": {"local_response": True},
+                        },
+                        "validation_errors": [],
+                    },
+                    "plan": [],
+                    "global_plan": [],
+                    "tool_events": [],
+                    "summary": local_response,
+                    "stop_reason": turn.stop_reason,
+                }
+                self._emit_update(self.normalizer.message_update(snapshot, local_response, result, []), emit_update)
+                return result
             plan_parse_result, planner_record = self._generate_plan(
                 snapshot=snapshot,
                 selected_model=resolved.option.value,
@@ -571,6 +726,50 @@ class Orchestrator:
             raise
         finally:
             self._clear_turn_registration(session_id, turn.turn_id)
+
+    def _coordinator_record(self, composite_model: str) -> dict[str, str | None]:
+        agent_id, _, model = composite_model.partition("::")
+        agent = next((candidate for candidate in self.catalog.agents if candidate.agent_id == agent_id), None)
+        return {
+            "agent_id": agent_id or None,
+            "agent_name": agent.name if agent is not None else agent_id or None,
+            "model": model or None,
+            "composite_model": composite_model or None,
+        }
+
+    def _maybe_build_local_response(self, snapshot: SessionSnapshot, user_prompt: str) -> str | None:
+        normalized = " ".join(user_prompt.lower().split())
+        if not normalized:
+            return None
+        identity_markers = (
+            "кто ты",
+            "что ты можешь",
+            "что ты умеешь",
+            "кто ты такой",
+            "расскажи о себе",
+            "представься",
+            "опиши себя",
+            "who are you",
+            "what can you do",
+            "what do you do",
+            "tell me about yourself",
+            "introduce yourself",
+            "describe yourself",
+        )
+        if not any(marker in normalized for marker in identity_markers):
+            return None
+        selected_model = snapshot.selected_model or "not selected"
+        if any("а" <= char <= "я" for char in normalized):
+            return (
+                "Я OrgeMage, ACP-оркестратор. Я управляю сессией, выбираю coordinator model, "
+                "делю работу между ACP-агентами, прокидываю session updates в ACP UI и веду историю сессии. "
+                f"Сейчас выбран координатор: {selected_model}."
+            )
+        return (
+            "I am OrgeMage, an ACP orchestrator. I manage the session, select the coordinator model, "
+            "delegate work across ACP agents, stream session updates to ACP UI, and persist session history. "
+            f"The current coordinator is {selected_model}."
+        )
 
     def _refresh_catalog_for_model(self, composite_model: str) -> None:
         agent_id, _, _ = composite_model.partition("::")
@@ -657,7 +856,12 @@ class Orchestrator:
         )
         raw_output = planning_result.raw_output or planning_result.summary
         validation_errors: list[str] = []
-        if planning_result.status == TaskStatus.CANCELLED:
+        if planning_result.status == TaskStatus.FAILED:
+            validation_errors = [f"Coordinator execution failed: {planning_result.summary}"]
+            fallback_plan = synthesize_local_fallback_plan(user_prompt, coordinator_agent_id=coordinator_agent.agent_id)
+            fallback_plan.normalized_plan["_meta"]["coordinator_errors"] = list(validation_errors)
+            plan_parse_result = fallback_plan
+        elif planning_result.status == TaskStatus.CANCELLED:
             plan_parse_result = PlanParseResult(
                 tasks=[],
                 normalized_plan={"tasks": [], "_meta": {"source": "cancelled", "coordinator_agent_id": coordinator_agent.agent_id}},
@@ -671,7 +875,11 @@ class Orchestrator:
                 fallback_plan.normalized_plan["_meta"]["coordinator_errors"] = list(parsed_plan.errors)
                 plan_parse_result = fallback_plan
             else:
-                plan_parse_result = parsed_plan
+                plan_parse_result = optimize_coordinator_plan(
+                    parsed_plan,
+                    coordinator_agent_id=coordinator_agent.agent_id,
+                    user_prompt=user_prompt,
+                )
 
         planner_record = {
             "raw_coordinator_output": raw_output,
@@ -826,7 +1034,9 @@ class Orchestrator:
             f"""
             You are the selected coordinator model for OrgeMage.
             Your first responsibility is planning: return a structured orchestration plan as JSON.
-            Do not return prose before or after the JSON object.
+            Return only one JSON object.
+            Do not wrap the JSON in markdown fences.
+            Do not return prose before the opening '{{' or after the final '}}'.
 
             Contract:
             {{
@@ -854,6 +1064,8 @@ class Orchestrator:
             - Keep permissions/filesystem/terminal access constrained to the upstream cwd.
             - Use assignee_hints and acceptable_models only when you have a concrete reason.
             - Prefer the smallest task graph that still covers implementation and validation.
+            - If the user explicitly asks for read-only behavior or says not to modify files/OS state, every task must stay read-only. Do not request edit, write, test, or terminal access in that case.
+            - If a single read-only task is sufficient, prefer a single read-only task assigned to the coordinator agent.
 
             User request:
             {user_prompt.strip()}
@@ -868,8 +1080,18 @@ class Orchestrator:
     def _final_summary(self, tasks: list[PlanTask], *, cancelled: bool = False) -> str:
         if cancelled:
             return "Turn cancelled."
+        if (
+            len(tasks) == 1
+            and tasks[0].status == TaskStatus.COMPLETED
+            and tasks[0].output
+        ):
+            return tasks[0].output
         completed = [task for task in tasks if task.status == TaskStatus.COMPLETED]
-        return f"Completed {len(completed)}/{len(tasks)} orchestrated tasks."
+        failed = [task for task in tasks if task.status == TaskStatus.FAILED]
+        task_count = len(tasks)
+        if task_count and failed:
+            return f"Completed {len(completed)}/{task_count} orchestrated tasks; {len(failed)} failed."
+        return f"Completed {len(completed)}/{task_count} orchestrated tasks."
 
     def _register_turn(self, session_id: str, turn_id: str) -> threading.Event:
         with self._turn_control_lock:

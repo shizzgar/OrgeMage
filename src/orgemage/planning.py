@@ -20,6 +20,51 @@ class PlanParseResult:
 
 
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+_READ_ONLY_COMMANDS = {"read", "search", "list", "glob", "grep", "find"}
+_READ_ONLY_REQUEST_MARKERS = (
+    "without os",
+    "without modifying",
+    "without making changes",
+    "read-only",
+    "read only",
+    "без вмешательства",
+    "без изменений",
+    "без модификации",
+    "не изменяя",
+    "ничего не меняй",
+    "ничего не изменяй",
+)
+_READ_ONLY_FILESYSTEM_MARKERS = (
+    "acp",
+    "analysis",
+    "analyze",
+    "architecture",
+    "code",
+    "file",
+    "files",
+    "module",
+    "modules",
+    "orchestrator",
+    "path",
+    "project",
+    "repo",
+    "repository",
+    "risk",
+    "smoke-test",
+    "smoke test",
+    "test",
+    "workspace",
+    "анализ",
+    "архитект",
+    "код",
+    "модул",
+    "оркестратор",
+    "проект",
+    "репозитор",
+    "риск",
+    "тест",
+    "файл",
+)
 
 
 def parse_coordinator_plan(
@@ -127,6 +172,70 @@ def synthesize_local_fallback_plan(
 ) -> PlanParseResult:
     normalized = user_prompt.strip()
     title = normalized.splitlines()[0][:72] if normalized else "Orchestration request"
+    if _looks_like_direct_response_request(normalized):
+        task = PlanTask(
+            title="Respond directly to the user",
+            details=f"Answer the user request directly and concisely: {title}",
+            required_capabilities={"planner": True},
+            assignee=coordinator_agent_id,
+            priority=100,
+            _meta={
+                "source": "local_fallback",
+                "synthesized_locally": True,
+                "fallback_reason": "coordinator_plan_invalid",
+                "fallback_mode": "direct_response",
+            },
+        )
+        normalized_plan = {
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "details": task.details,
+                    "dependencies": [],
+                    "dependency_ids": [],
+                    "required_capabilities": dict(task.required_capabilities),
+                    "assignee_hints": list(task.assignee_hints),
+                    "acceptable_models": list(task.acceptable_models),
+                    "priority": task.priority,
+                    "_meta": dict(task._meta),
+                }
+            ],
+            "_meta": {
+                "source": "local_fallback",
+                "coordinator_agent_id": coordinator_agent_id,
+                "synthesized_locally": True,
+                "task_count": 1,
+                "fallback_mode": "direct_response",
+            },
+        }
+        return PlanParseResult(tasks=[task], normalized_plan=normalized_plan, errors=[])
+    if _requests_read_only_response(normalized):
+        task = _build_read_only_fallback_task(normalized, coordinator_agent_id=coordinator_agent_id)
+        normalized_plan = {
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "title": task.title,
+                    "details": task.details,
+                    "dependencies": [],
+                    "dependency_ids": [],
+                    "required_capabilities": dict(task.required_capabilities),
+                    "assignee_hints": list(task.assignee_hints),
+                    "acceptable_models": list(task.acceptable_models),
+                    "priority": task.priority,
+                    "_meta": dict(task._meta),
+                }
+            ],
+            "_meta": {
+                "source": "local_fallback",
+                "coordinator_agent_id": coordinator_agent_id,
+                "synthesized_locally": True,
+                "task_count": 1,
+                "fallback_mode": "read_only_response",
+            },
+        }
+        return PlanParseResult(tasks=[task], normalized_plan=normalized_plan, errors=[])
     tasks = [
         PlanTask(
             title="Analyze request and produce execution plan",
@@ -201,6 +310,211 @@ def synthesize_local_fallback_plan(
         },
     }
     return PlanParseResult(tasks=tasks, normalized_plan=normalized_plan, errors=[])
+
+
+def optimize_coordinator_plan(
+    plan: PlanParseResult,
+    *,
+    coordinator_agent_id: str,
+    user_prompt: str,
+) -> PlanParseResult:
+    if not plan.is_valid or len(plan.tasks) <= 1:
+        return plan
+    read_only_requested = _requests_read_only_response(user_prompt)
+    if not all(
+        _task_is_single_agent_compatible_with_collapse(
+            task,
+            coordinator_agent_id=coordinator_agent_id,
+            allow_write_for_read_only_request=read_only_requested,
+        )
+        for task in plan.tasks
+    ):
+        return plan
+
+    commands = sorted(
+        {
+            str(command).strip()
+            for task in plan.tasks
+            for command in task.required_capabilities.get("commands", [])
+            if str(command).strip() and str(command).strip().lower() in _READ_ONLY_COMMANDS
+        }
+    )
+    needs_filesystem = any(bool(task.required_capabilities.get("needsFilesystem")) for task in plan.tasks)
+    acceptable_models = list(
+        dict.fromkeys(model for task in plan.tasks for model in task.acceptable_models if isinstance(model, str) and model.strip())
+    )
+    collapsed_task = PlanTask(
+        title="Respond directly to the user",
+        details=f"Answer the user request directly and concisely using read-only tools as needed: {user_prompt.strip()[:160]}",
+        required_capabilities={
+            "needsFilesystem": needs_filesystem,
+            "commands": commands,
+        },
+        acceptable_models=acceptable_models,
+        assignee=coordinator_agent_id,
+        priority=max(task.priority for task in plan.tasks),
+        _meta={
+            "source": "plan_optimization",
+            "optimization": "collapse_single_agent_read_only_plan",
+            "original_task_count": len(plan.tasks),
+        },
+    )
+    normalized_plan = {
+        "tasks": [
+            {
+                "task_id": collapsed_task.task_id,
+                "title": collapsed_task.title,
+                "details": collapsed_task.details,
+                "dependencies": [],
+                "dependency_ids": [],
+                "required_capabilities": dict(collapsed_task.required_capabilities),
+                "assignee_hints": list(collapsed_task.assignee_hints),
+                "acceptable_models": list(collapsed_task.acceptable_models),
+                "priority": collapsed_task.priority,
+                "_meta": dict(collapsed_task._meta),
+            }
+        ],
+        "_meta": {
+            **dict(plan.normalized_plan.get("_meta", {})),
+            "source": "coordinator",
+            "coordinator_agent_id": coordinator_agent_id,
+            "task_count": 1,
+            "optimized": True,
+            "optimization": "collapse_single_agent_read_only_plan",
+            "original_task_count": len(plan.tasks),
+        },
+    }
+    return PlanParseResult(tasks=[collapsed_task], normalized_plan=normalized_plan, errors=[])
+
+
+_DIRECT_RESPONSE_CODE_MARKERS = (
+    "/",
+    "\\",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".md",
+    ".sh",
+    "acp",
+    "api",
+    "bug",
+    "build",
+    "class",
+    "cli",
+    "code",
+    "commit",
+    "compile",
+    "css",
+    "database",
+    "debug",
+    "docker",
+    "edit",
+    "endpoint",
+    "file",
+    "fix",
+    "frontend",
+    "function",
+    "html",
+    "implement",
+    "json",
+    "migration",
+    "module",
+    "npm",
+    "orchestrator",
+    "patch",
+    "path",
+    "project",
+    "pytest",
+    "react",
+    "readme",
+    "refactor",
+    "repo",
+    "repository",
+    "run tests",
+    "script",
+    "search",
+    "sql",
+    "stack trace",
+    "terminal",
+    "test",
+    "typescript",
+    "workspace",
+    "yarn",
+    "исправ",
+    "код",
+    "проект",
+    "путь",
+    "реализ",
+    "рефактор",
+    "репозитор",
+    "тест",
+    "файл",
+)
+
+
+def _looks_like_direct_response_request(user_prompt: str) -> bool:
+    normalized = " ".join(user_prompt.lower().split())
+    if not normalized:
+        return True
+    if "```" in user_prompt:
+        return False
+    return not any(marker in normalized for marker in _DIRECT_RESPONSE_CODE_MARKERS)
+
+
+def _requests_read_only_response(user_prompt: str) -> bool:
+    normalized = " ".join(user_prompt.lower().split())
+    return any(marker in normalized for marker in _READ_ONLY_REQUEST_MARKERS)
+
+
+def _build_read_only_fallback_task(user_prompt: str, *, coordinator_agent_id: str) -> PlanTask:
+    normalized = " ".join(user_prompt.lower().split())
+    needs_filesystem = any(marker in normalized for marker in _READ_ONLY_FILESYSTEM_MARKERS)
+    commands = ["read"]
+    if needs_filesystem:
+        commands.append("search")
+    return PlanTask(
+        title="Respond directly to the user",
+        details=f"Answer the user request directly and concisely using read-only tools as needed: {user_prompt[:160]}",
+        required_capabilities={
+            "needsFilesystem": needs_filesystem,
+            "commands": commands,
+        },
+        assignee=coordinator_agent_id,
+        priority=100,
+        _meta={
+            "source": "local_fallback",
+            "synthesized_locally": True,
+            "fallback_reason": "coordinator_plan_invalid",
+            "fallback_mode": "read_only_response",
+        },
+    )
+
+
+def _task_is_single_agent_compatible_with_collapse(
+    task: PlanTask,
+    *,
+    coordinator_agent_id: str,
+    allow_write_for_read_only_request: bool,
+) -> bool:
+    assignee = task.assignee or coordinator_agent_id
+    if assignee != coordinator_agent_id:
+        return False
+    if bool(task.required_capabilities.get("needsTerminal")):
+        return False
+    commands = task.required_capabilities.get("commands", [])
+    if not isinstance(commands, list):
+        return False
+    normalized_commands = {str(command).strip().lower() for command in commands if str(command).strip()}
+    allowed_commands = set(_READ_ONLY_COMMANDS)
+    if allow_write_for_read_only_request:
+        allowed_commands.add("write")
+    return normalized_commands.issubset(allowed_commands)
 
 
 def _parse_task(
@@ -300,6 +614,16 @@ def _extract_json_payload(raw_output: str) -> Any:
             return json.loads(candidate)
         except json.JSONDecodeError:
             continue
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(stripped):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(stripped[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
     return None
 
 
